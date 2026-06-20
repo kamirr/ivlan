@@ -1,0 +1,4 @@
+[workspace]
+packages = ["crates/ivlan-cli"]
+resolver = "3"
+members = ["crates/ivlan-cli","crates/ivlan-rpc","crates/ivland"]

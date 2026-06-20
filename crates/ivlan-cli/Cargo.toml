@@ -1,0 +1,13 @@
+[package]
+name = "ivlan-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+base64 = "0.22.1"
+clap = { version = "4.5.0", features = ["derive", "env"] }
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "1.1.2"
+iroh-base = "1.0.0"
+ivlan-rpc = { path = "../ivlan-rpc" }
+dotenv = "0.15.0"

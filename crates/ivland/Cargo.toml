@@ -1,0 +1,17 @@
+[package]
+name = "ivland"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ivlan-rpc = { path = "../ivlan-rpc" }
+clap = { version = "4.5.0", features = ["derive", "env"] }
+iroh = "1.0.0"
+tun-rs = { version = "2.8.5", features = ["async"] }
+anyhow = "1.0"
+futures = "0.3"
+tarpc = { version = "0.37", features = ["full"] }
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros"] }
+log = "0.4.32"
+env_logger = "0.11.10"
+dotenv = "0.15.0"
