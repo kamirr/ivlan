@@ -4,10 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = { workspace = true }
 base64 = "0.22.1"
-clap = { version = "4.5.0", features = ["derive", "env"] }
-serde = { version = "1.0.228", features = ["derive"] }
-toml = "1.1.2"
+clap = { workspace = true }
+dotenv = { workspace = true }
 iroh-base = "1.0.0"
 ivlan-rpc = { path = "../ivlan-rpc" }
-dotenv = "0.15.0"
+serde = { version = "1.0.228", features = ["derive"] }
+tarpc = { workspace = true }
+toml = "1.1.2"
+tokio = { workspace = true }

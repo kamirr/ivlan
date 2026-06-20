@@ -66,6 +66,7 @@ pub mod pk_serde {
     }
 }
 
+#[expect(dead_code)]
 pub fn pk_to_string(pk: &iroh_base::PublicKey) -> String {
     use serde::Serialize;
 
@@ -79,6 +80,7 @@ pub fn pk_to_string(pk: &iroh_base::PublicKey) -> String {
     me_str
 }
 
+#[expect(dead_code)]
 pub fn pk_from_string(s: &str) -> iroh_base::PublicKey {
     use serde::Deserialize;
 

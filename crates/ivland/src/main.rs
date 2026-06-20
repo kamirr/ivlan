@@ -1,5 +1,5 @@
 use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
 };
 
@@ -51,8 +51,8 @@ struct Args {
     #[arg(env = "IV_IF_NAME", default_value = "iv")]
     if_name: String,
 
-    #[arg(long, env = "IV_RPC_PORT", default_value_t = 2334)]
-    rpc_port: u16,
+    #[clap(long, env = "IV_RPC_ADDR", default_value = "127.0.0.1:2334")]
+    rpc_addr: SocketAddr,
 
     #[arg(long, env = "IV_MTU", default_value_t = 1500)]
     mtu: u16,
@@ -91,11 +91,9 @@ async fn main() -> anyhow::Result<()> {
     let dev = builder.build_async()?;
     let state = IvLanState::new(dev);
 
-    let server_addr = (IpAddr::V4(Ipv4Addr::LOCALHOST), args.rpc_port);
-
     // JSON transport is provided by the json_transport tarpc module. It makes it easy
     // to start up a serde-powered json serialization strategy over TCP.
-    let mut listener = tarpc::serde_transport::tcp::listen(&server_addr, Json::default).await?;
+    let mut listener = tarpc::serde_transport::tcp::listen(args.rpc_addr, Json::default).await?;
     log::info!("Listening on port {}", listener.local_addr().port());
 
     listener.config_mut().max_frame_length(usize::MAX);

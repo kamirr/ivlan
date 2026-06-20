@@ -1,10 +1,12 @@
 use std::{
     collections::BTreeMap,
+    net::SocketAddr,
     path::{Path, PathBuf},
 };
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use tarpc::tokio_serde::formats::Json;
 
 mod util;
 
@@ -49,8 +51,8 @@ struct Args {
     #[arg(short, long, env = "IV_CONFIG", default_value = "iv-lan.toml")]
     config: PathBuf,
 
-    #[arg(long, env = "IV_RPC_PORT", default_value_t = 2334)]
-    rpc_port: u16,
+    #[clap(long, env = "IV_RPC_ADDR", default_value = "127.0.0.1:2334")]
+    rpc_addr: SocketAddr,
 
     #[command(subcommand)]
     cmd: Command,
@@ -65,7 +67,41 @@ enum Command {
     Init,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
     let args = Args::parse();
+
+    match args.cmd {
+        Command::Setup { force } => {
+            if args.config.exists() && !force {
+                eprintln!(
+                    "iv-lan configuration file already exists at {}. Use --force to overwrite.",
+                    args.config.display()
+                );
+                std::process::exit(1);
+            }
+
+            Config::setup().write(&args.config);
+        }
+        Command::Init => {
+            let config = Config::read(&args.config);
+
+            let mut transport = tarpc::serde_transport::tcp::connect(args.rpc_addr, Json::default);
+            transport.config_mut().max_frame_length(usize::MAX);
+
+            let client = ivlan_rpc::IvLanServiceClient::new(
+                tarpc::client::Config::default(),
+                transport.await?,
+            )
+            .spawn();
+
+            client
+                .start(tarpc::context::current(), config.sk)
+                .await
+                .unwrap();
+        }
+    }
+
+    Ok(())
 }
