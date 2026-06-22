@@ -65,6 +65,9 @@ enum Command {
         force: bool,
     },
     Init,
+    Connect {
+        remote: iroh_base::PublicKey,
+    },
 }
 
 #[tokio::main]
@@ -99,7 +102,27 @@ async fn main() -> anyhow::Result<()> {
             client
                 .start(tarpc::context::current(), config.sk)
                 .await
+                .unwrap()
                 .unwrap();
+        }
+        Command::Connect { remote } => {
+            let mut transport = tarpc::serde_transport::tcp::connect(args.rpc_addr, Json::default);
+            transport.config_mut().max_frame_length(usize::MAX);
+
+            let client = ivlan_rpc::IvLanServiceClient::new(
+                tarpc::client::Config::default(),
+                transport.await?,
+            )
+            .spawn();
+
+            let (ipv4, ipv6) = client
+                .connect(tarpc::context::current(), remote)
+                .await
+                .unwrap()
+                .unwrap();
+
+            println!("ipv4: {ipv4}");
+            println!("ipv6: {ipv6}");
         }
     }
 
