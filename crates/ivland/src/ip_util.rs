@@ -1,6 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use etherparse::{NetSlice, SlicedPacket};
+use ivlan_rpc::IpAddrs;
 
 fn calculate_checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
@@ -131,10 +132,8 @@ fn recalculate_udp_checksum_ipv6(
 pub fn patch_packet_addresses(
     buf: &mut [u8],
     len: usize,
-    src_ipv4: Ipv4Addr,
-    src_ipv6: Ipv6Addr,
-    dst_ipv4: Ipv4Addr,
-    dst_ipv6: Ipv6Addr,
+    src: IpAddrs,
+    dst: IpAddrs,
 ) -> anyhow::Result<Option<(IpAddr, IpAddr)>> {
     let Ok(SlicedPacket { net, .. }) = SlicedPacket::from_ip(&buf[..len]) else {
         anyhow::bail!("Bad packet");
@@ -149,8 +148,8 @@ pub fn patch_packet_addresses(
             let dst_offset = 16;
             let checksum_offset = 10;
 
-            buf[src_offset..src_offset + 4].copy_from_slice(&src_ipv4.octets());
-            buf[dst_offset..dst_offset + 4].copy_from_slice(&dst_ipv4.octets());
+            buf[src_offset..src_offset + 4].copy_from_slice(&src.v4.octets());
+            buf[dst_offset..dst_offset + 4].copy_from_slice(&dst.v4.octets());
             buf[checksum_offset..checksum_offset + 2].copy_from_slice(&[0, 0]);
 
             let mut sum: u32 = 0;
@@ -168,24 +167,24 @@ pub fn patch_packet_addresses(
             match protocol {
                 6 => {
                     // TCP
-                    recalculate_tcp_checksum_ipv4(buf, len, src_ipv4, dst_ipv4, header_len);
+                    recalculate_tcp_checksum_ipv4(buf, len, src.v4, dst.v4, header_len);
                 }
                 17 => {
                     // UDP
-                    recalculate_udp_checksum_ipv4(buf, len, src_ipv4, dst_ipv4, header_len);
+                    recalculate_udp_checksum_ipv4(buf, len, src.v4, dst.v4, header_len);
                 }
                 _ => {}
             }
 
-            Ok(Some((IpAddr::V4(src_ipv4), IpAddr::V4(dst_ipv4))))
+            Ok(Some((IpAddr::V4(src.v4), IpAddr::V4(dst.v4))))
         }
         Some(NetSlice::Ipv6(ipv6)) => {
             let src_offset = 8;
             let dst_offset = 24;
             let next_header = ipv6.header().next_header().0;
 
-            buf[src_offset..src_offset + 16].copy_from_slice(&src_ipv6.octets());
-            buf[dst_offset..dst_offset + 16].copy_from_slice(&dst_ipv6.octets());
+            buf[src_offset..src_offset + 16].copy_from_slice(&src.v6.octets());
+            buf[dst_offset..dst_offset + 16].copy_from_slice(&dst.v6.octets());
 
             // Recalculate TCP/UDP checksums if present
             // IPv6 header is always 40 bytes
@@ -193,16 +192,16 @@ pub fn patch_packet_addresses(
             match next_header {
                 6 => {
                     // TCP
-                    recalculate_tcp_checksum_ipv6(buf, len, src_ipv6, dst_ipv6, transport_start);
+                    recalculate_tcp_checksum_ipv6(buf, len, src.v6, dst.v6, transport_start);
                 }
                 17 => {
                     // UDP
-                    recalculate_udp_checksum_ipv6(buf, len, src_ipv6, dst_ipv6, transport_start);
+                    recalculate_udp_checksum_ipv6(buf, len, src.v6, dst.v6, transport_start);
                 }
                 _ => {}
             }
 
-            Ok(Some((IpAddr::V6(src_ipv6), IpAddr::V6(dst_ipv6))))
+            Ok(Some((IpAddr::V6(src.v6), IpAddr::V6(dst.v6))))
         }
         _ => Ok(None),
     }

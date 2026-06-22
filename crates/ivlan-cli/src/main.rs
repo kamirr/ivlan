@@ -68,6 +68,10 @@ enum Command {
     Connect {
         remote: iroh_base::PublicKey,
     },
+    Lookup {
+        remote: iroh_base::PublicKey,
+    },
+    Peers,
 }
 
 #[tokio::main]
@@ -115,14 +119,52 @@ async fn main() -> anyhow::Result<()> {
             )
             .spawn();
 
-            let (ipv4, ipv6) = client
+            let addrs = client
                 .connect(tarpc::context::current(), remote)
                 .await
                 .unwrap()
                 .unwrap();
 
-            println!("ipv4: {ipv4}");
-            println!("ipv6: {ipv6}");
+            println!("ipv4: {}", addrs.v4);
+            println!("ipv6: {}", addrs.v6);
+        }
+        Command::Lookup { remote } => {
+            let mut transport = tarpc::serde_transport::tcp::connect(args.rpc_addr, Json::default);
+            transport.config_mut().max_frame_length(usize::MAX);
+
+            let client = ivlan_rpc::IvLanServiceClient::new(
+                tarpc::client::Config::default(),
+                transport.await?,
+            )
+            .spawn();
+
+            let addrs = client
+                .lookup(tarpc::context::current(), remote)
+                .await
+                .unwrap()
+                .unwrap();
+
+            println!("remote: {remote}");
+            println!("- ipv4: {}", addrs.v4);
+            println!("- ipv6: {}", addrs.v6);
+        }
+        Command::Peers => {
+            let mut transport = tarpc::serde_transport::tcp::connect(args.rpc_addr, Json::default);
+            transport.config_mut().max_frame_length(usize::MAX);
+
+            let client = ivlan_rpc::IvLanServiceClient::new(
+                tarpc::client::Config::default(),
+                transport.await?,
+            )
+            .spawn();
+
+            let peers = client.peers(tarpc::context::current()).await.unwrap();
+
+            for (remote, addrs) in peers {
+                println!("remote: {remote}");
+                println!("- ipv4: {}", addrs.v4);
+                println!("- ipv6: {}", addrs.v6);
+            }
         }
     }
 

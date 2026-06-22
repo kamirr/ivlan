@@ -5,4 +5,5 @@ edition = "2024"
 
 [dependencies]
 iroh = { workspace = true }
+serde = { version = "1.0.228", features = ["derive"] }
 tarpc = { workspace = true }

@@ -13,7 +13,7 @@ use iroh::{
     PublicKey,
     endpoint::{RecvStream, SendStream},
 };
-use ivlan_rpc::IvLanService;
+use ivlan_rpc::{IpAddrs, IvLanService};
 use tarpc::{
     server::{Channel as _, incoming::Incoming as _},
     tokio_serde::formats::Json,
@@ -22,8 +22,7 @@ use tokio::{io::AsyncReadExt as _, sync::Mutex};
 use tun_rs::{AsyncDevice, DeviceBuilder};
 
 struct Peer {
-    ipv4: Ipv4Addr,
-    ipv6: Ipv6Addr,
+    addrs: IpAddrs,
     tx: SendStream,
 }
 
@@ -32,20 +31,15 @@ struct IvLanStateInner {
     dev: Arc<AsyncDevice>,
     endpoint: Option<Arc<iroh::Endpoint>>,
     peers: BTreeMap<PublicKey, Peer>,
-    ipv4addr: Ipv4Addr,
+    addrs: IpAddrs,
     ipv4mask: u8,
-    ipv6addr: Ipv6Addr,
     ipv6mask: u8,
 }
 
 impl IvLanStateInner {
-    fn insert_peer(
-        &mut self,
-        remote: PublicKey,
-        tx: SendStream,
-    ) -> anyhow::Result<(Ipv4Addr, Ipv6Addr)> {
-        if let Some(Peer { ipv4, ipv6, .. }) = self.peers.get(&remote) {
-            return Ok((*ipv4, *ipv6));
+    fn insert_peer(&mut self, remote: PublicKey, tx: SendStream) -> anyhow::Result<IpAddrs> {
+        if let Some(Peer { addrs, .. }) = self.peers.get(&remote) {
+            return Ok(*addrs);
         }
 
         let ipv4 = match self.allocate_ipv4() {
@@ -71,8 +65,9 @@ impl IvLanStateInner {
             ipv6
         );
 
-        self.peers.insert(remote, Peer { ipv4, ipv6, tx });
-        Ok((ipv4, ipv6))
+        let addrs = IpAddrs { v4: ipv4, v6: ipv6 };
+        self.peers.insert(remote, Peer { addrs, tx });
+        Ok(addrs)
     }
 
     fn allocate_ipv4(&self) -> Option<Ipv4Addr> {
@@ -88,13 +83,13 @@ impl IvLanStateInner {
         let max_offset = (1u32 << host_bits) - 2; // Reserve broadcast address
 
         for offset in 1..=max_offset {
-            let candidate = Ipv4Addr::from(u32::from(self.ipv4addr) + offset);
+            let candidate = Ipv4Addr::from(u32::from(self.addrs.v4) + offset);
 
-            if candidate == self.ipv4addr {
+            if candidate == self.addrs.v4 {
                 continue;
             }
 
-            if self.peers.values().any(|p| p.ipv4 == candidate) {
+            if self.peers.values().any(|p| p.addrs.v4 == candidate) {
                 continue;
             }
 
@@ -117,13 +112,13 @@ impl IvLanStateInner {
         let max_offset = (1u128 << host_bits) - 2; // Reserve high address
 
         for offset in 1..=max_offset {
-            let candidate = Ipv6Addr::from(u128::from(self.ipv6addr) + offset);
+            let candidate = Ipv6Addr::from(u128::from(self.addrs.v6) + offset);
 
-            if candidate == self.ipv6addr {
+            if candidate == self.addrs.v6 {
                 continue;
             }
 
-            if self.peers.values().any(|p| p.ipv6 == candidate) {
+            if self.peers.values().any(|p| p.addrs.v6 == candidate) {
                 continue;
             }
 
@@ -133,15 +128,8 @@ impl IvLanStateInner {
         None
     }
 
-    fn start_rx_stream(
-        &mut self,
-        remote: PublicKey,
-        rx: RecvStream,
-        peer_ipv4: Ipv4Addr,
-        peer_ipv6: Ipv6Addr,
-    ) {
-        let (host_ipv4, host_ipv6) = (self.ipv4addr, self.ipv6addr);
-
+    fn start_rx_stream(&mut self, remote: PublicKey, rx: RecvStream, peer_addrs: IpAddrs) {
+        let host_addrs = self.addrs;
         let mut buf = vec![0; 65536];
         let mut rx = rx;
         let dev = Arc::clone(&self.dev);
@@ -151,10 +139,8 @@ impl IvLanStateInner {
                 let len = rx.read_u16_le().await.unwrap() as usize;
                 rx.read_exact(&mut buf[..len]).await.unwrap();
 
-                let patch = ip_util::patch_packet_addresses(
-                    &mut buf, len, peer_ipv4, peer_ipv6, host_ipv4, host_ipv6,
-                )
-                .unwrap();
+                let patch =
+                    ip_util::patch_packet_addresses(&mut buf, len, peer_addrs, host_addrs).unwrap();
 
                 if let Some((src, dst)) = patch {
                     let txd = dev.send(&buf[..len]).await.unwrap();
@@ -177,9 +163,9 @@ struct IvLanState {
 impl IvLanState {
     pub fn new(
         dev: AsyncDevice,
-        ipv4addr: Ipv4Addr,
+        ipv4: Ipv4Addr,
         ipv4mask: u8,
-        ipv6addr: Ipv6Addr,
+        ipv6: Ipv6Addr,
         ipv6mask: u8,
     ) -> Self {
         IvLanState {
@@ -188,9 +174,8 @@ impl IvLanState {
                 dev: Arc::new(dev),
                 endpoint: None,
                 peers: BTreeMap::new(),
-                ipv4addr,
+                addrs: IpAddrs { v4: ipv4, v6: ipv6 },
                 ipv4mask,
-                ipv6addr,
                 ipv6mask,
             })),
         }
@@ -255,8 +240,8 @@ impl IvLanState {
                 let remote = conn.remote_id();
 
                 let mut inner = this.inner.lock().await;
-                let (pip4, pip6) = inner.insert_peer(remote, tx).unwrap();
-                inner.start_rx_stream(remote, rx, pip4, pip6);
+                let peer_addrs = inner.insert_peer(remote, tx).unwrap();
+                inner.start_rx_stream(remote, rx, peer_addrs);
             }
         });
 
@@ -276,7 +261,10 @@ impl IvLanState {
                 match net {
                     NetSlice::Ipv4(ipv4) => {
                         let dst = ipv4.header().destination_addr();
-                        let peer = state.peers.iter_mut().find(|(_, peer)| peer.ipv4 == dst);
+                        let peer = state
+                            .peers
+                            .iter_mut()
+                            .find(|(_, peer)| peer.addrs.v4 == dst);
 
                         if let Some((remote, peer)) = peer {
                             peer.tx.write(&len.to_le_bytes()).await.unwrap();
@@ -314,7 +302,10 @@ impl IvLanState {
                             continue;
                         }
 
-                        let peer = state.peers.iter_mut().find(|(_, peer)| peer.ipv6 == dst);
+                        let peer = state
+                            .peers
+                            .iter_mut()
+                            .find(|(_, peer)| peer.addrs.v6 == dst);
 
                         if let Some((remote, peer)) = peer {
                             peer.tx.write(&len.to_le_bytes()).await.unwrap();
@@ -358,19 +349,14 @@ impl IvLanState {
         self,
         _cx: tarpc::context::Context,
         pk: iroh::PublicKey,
-    ) -> anyhow::Result<(Ipv4Addr, Ipv6Addr)> {
-        {
-            let state = self.inner.lock().await;
-            if let Some(peer) = state.peers.get(&pk) {
-                return Ok((peer.ipv4, peer.ipv6));
-            }
+    ) -> anyhow::Result<IpAddrs> {
+        let mut state = self.inner.lock().await;
+        if let Some(peer) = state.peers.get(&pk) {
+            return Ok(peer.addrs);
         }
 
         // Peer not found, establish a connection via iroh
-        let endpoint = self
-            .inner
-            .lock()
-            .await
+        let endpoint = state
             .endpoint
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Endpoint not initialized"))?
@@ -381,11 +367,33 @@ impl IvLanState {
         let (tx, rx) = conn.open_bi().await?;
 
         // Allocate addresses and start recv stream
-        let mut inner = self.inner.lock().await;
-        let (pip4, pip6) = inner.insert_peer(conn.remote_id(), tx)?;
-        inner.start_rx_stream(conn.remote_id(), rx, pip4, pip6);
+        let peer_addrs = state.insert_peer(conn.remote_id(), tx)?;
+        state.start_rx_stream(conn.remote_id(), rx, peer_addrs);
 
-        Ok((pip4, pip6))
+        Ok(peer_addrs)
+    }
+
+    async fn lookup_impl(
+        self,
+        _cx: tarpc::context::Context,
+        pk: iroh::PublicKey,
+    ) -> anyhow::Result<IpAddrs> {
+        let state = self.inner.lock().await;
+        if let Some(peer) = state.peers.get(&pk) {
+            Ok(peer.addrs)
+        } else {
+            anyhow::bail!("Peer not connected")
+        }
+    }
+
+    async fn peers_impl(self, _cx: tarpc::context::Context) -> BTreeMap<iroh::PublicKey, IpAddrs> {
+        self.inner
+            .lock()
+            .await
+            .peers
+            .iter()
+            .map(|(pk, peer)| (*pk, peer.addrs))
+            .collect()
     }
 }
 
@@ -398,8 +406,20 @@ impl IvLanService for IvLanState {
         self,
         cx: tarpc::context::Context,
         pk: iroh::PublicKey,
-    ) -> Result<(Ipv4Addr, Ipv6Addr), String> {
+    ) -> Result<IpAddrs, String> {
         self.connect_impl(cx, pk).await.map_err(|e| e.to_string())
+    }
+
+    async fn lookup(
+        self,
+        cx: tarpc::context::Context,
+        pk: iroh::PublicKey,
+    ) -> Result<IpAddrs, String> {
+        self.lookup_impl(cx, pk).await.map_err(|e| e.to_string())
+    }
+
+    async fn peers(self, cx: tarpc::context::Context) -> BTreeMap<iroh::PublicKey, IpAddrs> {
+        self.peers_impl(cx).await
     }
 }
 

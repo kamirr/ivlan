@@ -1919,6 +1919,7 @@ name = "ivlan-rpc"
 version = "0.1.0"
 dependencies = [
  "iroh",
+ "serde",
  "tarpc",
 ]
 
