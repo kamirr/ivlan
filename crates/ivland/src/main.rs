@@ -1,19 +1,24 @@
+mod ip_util;
+
 use std::{
     collections::BTreeMap,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
 };
 
 use clap::Parser;
 use etherparse::{ArpOperation, NetSlice, SlicedPacket};
-use futures::StreamExt;
-use iroh::{PublicKey, endpoint::SendStream};
+use futures::StreamExt as _;
+use iroh::{
+    PublicKey,
+    endpoint::{RecvStream, SendStream},
+};
 use ivlan_rpc::IvLanService;
 use tarpc::{
-    server::{Channel, incoming::Incoming as _},
+    server::{Channel as _, incoming::Incoming as _},
     tokio_serde::formats::Json,
 };
-use tokio::{io::AsyncReadExt, sync::Mutex};
+use tokio::{io::AsyncReadExt as _, sync::Mutex};
 use tun_rs::{AsyncDevice, DeviceBuilder};
 
 struct Peer {
@@ -127,211 +132,40 @@ impl IvLanStateInner {
 
         None
     }
-}
 
-fn calculate_checksum(data: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
-    for chunk in data.chunks(2) {
-        let word = if chunk.len() == 2 {
-            u16::from_be_bytes([chunk[0], chunk[1]])
-        } else {
-            (chunk[0] as u16) << 8
-        };
-        sum += word as u32;
-    }
-    while (sum >> 16) > 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !sum as u16
-}
+    fn start_rx_stream(
+        &mut self,
+        remote: PublicKey,
+        rx: RecvStream,
+        peer_ipv4: Ipv4Addr,
+        peer_ipv6: Ipv6Addr,
+    ) {
+        let (host_ipv4, host_ipv6) = (self.ipv4addr, self.ipv6addr);
 
-fn recalculate_tcp_checksum_ipv4(
-    buf: &mut [u8],
-    len: usize,
-    src: Ipv4Addr,
-    dst: Ipv4Addr,
-    tcp_start: usize,
-) {
-    let tcp_len = len - tcp_start;
+        let mut buf = vec![0; 65536];
+        let mut rx = rx;
+        let dev = Arc::clone(&self.dev);
 
-    // Zero out checksum field
-    buf[tcp_start + 16..tcp_start + 18].copy_from_slice(&[0, 0]);
+        tokio::spawn(async move {
+            loop {
+                let len = rx.read_u16_le().await.unwrap() as usize;
+                rx.read_exact(&mut buf[..len]).await.unwrap();
 
-    // Build pseudo-header: src(4) + dst(4) + zero(1) + protocol(1) + tcp_len(2)
-    let mut pseudo = Vec::with_capacity(12 + tcp_len);
-    pseudo.extend_from_slice(&src.octets());
-    pseudo.extend_from_slice(&dst.octets());
-    pseudo.push(0);
-    pseudo.push(6); // TCP protocol
-    pseudo.extend_from_slice(&(tcp_len as u16).to_be_bytes());
-    pseudo.extend_from_slice(&buf[tcp_start..len]);
+                let patch = ip_util::patch_packet_addresses(
+                    &mut buf, len, peer_ipv4, peer_ipv6, host_ipv4, host_ipv6,
+                )
+                .unwrap();
 
-    let checksum = calculate_checksum(&pseudo);
-    buf[tcp_start + 16..tcp_start + 18].copy_from_slice(&checksum.to_be_bytes());
-}
-
-fn recalculate_udp_checksum_ipv4(
-    buf: &mut [u8],
-    len: usize,
-    src: Ipv4Addr,
-    dst: Ipv4Addr,
-    udp_start: usize,
-) {
-    let udp_len = len - udp_start;
-
-    // Zero out checksum field (only if it's non-zero, IPv4 UDP can have 0 checksum)
-    let checksum_offset = udp_start + 6;
-
-    // Build pseudo-header
-    let mut pseudo = Vec::with_capacity(12 + udp_len);
-    pseudo.extend_from_slice(&src.octets());
-    pseudo.extend_from_slice(&dst.octets());
-    pseudo.push(0);
-    pseudo.push(17); // UDP protocol
-    pseudo.extend_from_slice(&(udp_len as u16).to_be_bytes());
-
-    // Save and zero checksum
-    let _saved_checksum = u16::from_be_bytes([buf[checksum_offset], buf[checksum_offset + 1]]);
-    buf[checksum_offset..checksum_offset + 2].copy_from_slice(&[0, 0]);
-
-    pseudo.extend_from_slice(&buf[udp_start..len]);
-
-    let mut checksum = calculate_checksum(&pseudo);
-    if checksum == 0 {
-        checksum = 0xffff; // For IPv4, 0 means no checksum, so use 0xffff
-    }
-
-    buf[checksum_offset..checksum_offset + 2].copy_from_slice(&checksum.to_be_bytes());
-}
-
-fn recalculate_tcp_checksum_ipv6(
-    buf: &mut [u8],
-    len: usize,
-    src: Ipv6Addr,
-    dst: Ipv6Addr,
-    tcp_start: usize,
-) {
-    let tcp_len = len - tcp_start;
-
-    // Zero out checksum field
-    buf[tcp_start + 16..tcp_start + 18].copy_from_slice(&[0, 0]);
-
-    // Build pseudo-header: src(16) + dst(16) + payload_len(4) + zeros(3) + next_header(1)
-    let mut pseudo = Vec::with_capacity(40 + tcp_len);
-    pseudo.extend_from_slice(&src.octets());
-    pseudo.extend_from_slice(&dst.octets());
-    pseudo.extend_from_slice(&(tcp_len as u32).to_be_bytes());
-    pseudo.extend_from_slice(&[0, 0, 0, 6]); // zeros + TCP protocol
-    pseudo.extend_from_slice(&buf[tcp_start..len]);
-
-    let checksum = calculate_checksum(&pseudo);
-    buf[tcp_start + 16..tcp_start + 18].copy_from_slice(&checksum.to_be_bytes());
-}
-
-fn recalculate_udp_checksum_ipv6(
-    buf: &mut [u8],
-    len: usize,
-    src: Ipv6Addr,
-    dst: Ipv6Addr,
-    udp_start: usize,
-) {
-    let udp_len = len - udp_start;
-    let checksum_offset = udp_start + 6;
-
-    // Build pseudo-header
-    let mut pseudo = Vec::with_capacity(40 + udp_len);
-    pseudo.extend_from_slice(&src.octets());
-    pseudo.extend_from_slice(&dst.octets());
-    pseudo.extend_from_slice(&(udp_len as u32).to_be_bytes());
-    pseudo.extend_from_slice(&[0, 0, 0, 17]); // zeros + UDP protocol
-
-    // Zero checksum
-    buf[checksum_offset..checksum_offset + 2].copy_from_slice(&[0, 0]);
-
-    pseudo.extend_from_slice(&buf[udp_start..len]);
-
-    let checksum = calculate_checksum(&pseudo);
-    let checksum = if checksum == 0 { 0xffff } else { checksum };
-    buf[checksum_offset..checksum_offset + 2].copy_from_slice(&checksum.to_be_bytes());
-}
-
-fn patch_packet_addresses(
-    buf: &mut [u8],
-    len: usize,
-    src_ipv4: Ipv4Addr,
-    src_ipv6: Ipv6Addr,
-    dst_ipv4: Ipv4Addr,
-    dst_ipv6: Ipv6Addr,
-) -> anyhow::Result<Option<(IpAddr, IpAddr)>> {
-    let Ok(SlicedPacket { net, .. }) = SlicedPacket::from_ip(&buf[..len]) else {
-        anyhow::bail!("Bad packet");
-    };
-
-    match net {
-        Some(NetSlice::Ipv4(ipv4)) => {
-            let header_len = (ipv4.header().ihl() as usize) * 4;
-            let protocol = ipv4.header().protocol().0;
-
-            let src_offset = 12;
-            let dst_offset = 16;
-            let checksum_offset = 10;
-
-            buf[src_offset..src_offset + 4].copy_from_slice(&src_ipv4.octets());
-            buf[dst_offset..dst_offset + 4].copy_from_slice(&dst_ipv4.octets());
-            buf[checksum_offset..checksum_offset + 2].copy_from_slice(&[0, 0]);
-
-            let mut sum: u32 = 0;
-            for i in (0..header_len).step_by(2) {
-                let word = u16::from_be_bytes([buf[i], buf[i + 1]]);
-                sum += word as u32;
-            }
-            while (sum >> 16) > 0 {
-                sum = (sum & 0xffff) + (sum >> 16);
-            }
-            let checksum = !sum as u16;
-            buf[checksum_offset..checksum_offset + 2].copy_from_slice(&checksum.to_be_bytes());
-
-            // Recalculate TCP/UDP checksums if present
-            match protocol {
-                6 => {
-                    // TCP
-                    recalculate_tcp_checksum_ipv4(buf, len, src_ipv4, dst_ipv4, header_len);
+                if let Some((src, dst)) = patch {
+                    let txd = dev.send(&buf[..len]).await.unwrap();
+                    log::trace!(
+                        "IV recv/0 src={remote}, payload={len} | PATCHED src={src}, dst={dst} | WR {txd}"
+                    );
+                } else {
+                    log::debug!("IV recv/0 src={remote}, payload={len} | SKIP");
                 }
-                17 => {
-                    // UDP
-                    recalculate_udp_checksum_ipv4(buf, len, src_ipv4, dst_ipv4, header_len);
-                }
-                _ => {}
             }
-
-            Ok(Some((IpAddr::V4(src_ipv4), IpAddr::V4(dst_ipv4))))
-        }
-        Some(NetSlice::Ipv6(ipv6)) => {
-            let src_offset = 8;
-            let dst_offset = 24;
-            let next_header = ipv6.header().next_header().0;
-
-            buf[src_offset..src_offset + 16].copy_from_slice(&src_ipv6.octets());
-            buf[dst_offset..dst_offset + 16].copy_from_slice(&dst_ipv6.octets());
-
-            // Recalculate TCP/UDP checksums if present
-            // IPv6 header is always 40 bytes
-            let transport_start = 40;
-            match next_header {
-                6 => {
-                    // TCP
-                    recalculate_tcp_checksum_ipv6(buf, len, src_ipv6, dst_ipv6, transport_start);
-                }
-                17 => {
-                    // UDP
-                    recalculate_udp_checksum_ipv6(buf, len, src_ipv6, dst_ipv6, transport_start);
-                }
-                _ => {}
-            }
-
-            Ok(Some((IpAddr::V6(src_ipv6), IpAddr::V6(dst_ipv6))))
-        }
-        _ => Ok(None),
+        });
     }
 }
 
@@ -393,7 +227,6 @@ impl IvLanState {
         }
 
         let this = self.clone();
-        let dev_ = Arc::clone(&dev);
         tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
                 let accepting = match incoming.accept() {
@@ -411,7 +244,7 @@ impl IvLanState {
                     }
                 };
 
-                let (tx, mut rx) = match conn.accept_bi().await {
+                let (tx, rx) = match conn.accept_bi().await {
                     Ok(p) => p,
                     Err(e) => {
                         log::warn!("Couldn't accept bidirectional: {}", e);
@@ -420,35 +253,10 @@ impl IvLanState {
                 };
 
                 let remote = conn.remote_id();
-                let (peer_ipv4, peer_ipv6, host_ipv4, host_ipv6) = {
-                    let mut inner = this.inner.lock().await;
-                    let (pip4, pip6) = inner.insert_peer(remote, tx).unwrap();
-                    let (hip4, hip6) = (inner.ipv4addr, inner.ipv6addr);
-                    (pip4, pip6, hip4, hip6)
-                };
 
-                let mut buf = vec![0; 65536];
-                let dev_ = Arc::clone(&dev_);
-                tokio::spawn(async move {
-                    loop {
-                        let len = rx.read_u16_le().await.unwrap() as usize;
-                        rx.read_exact(&mut buf[..len]).await.unwrap();
-
-                        let patch = patch_packet_addresses(
-                            &mut buf, len, peer_ipv4, peer_ipv6, host_ipv4, host_ipv6,
-                        )
-                        .unwrap();
-
-                        if let Some((src, dst)) = patch {
-                            let txd = dev_.send(&buf[..len]).await.unwrap();
-                            log::trace!(
-                                "IV recv/0 src={remote}, payload={len} | PATCHED src={src}, dst={dst} | WR {txd}"
-                            );
-                        } else {
-                            log::debug!("IV recv/0 src={remote}, payload={len} | SKIP");
-                        }
-                    }
-                });
+                let mut inner = this.inner.lock().await;
+                let (pip4, pip6) = inner.insert_peer(remote, tx).unwrap();
+                inner.start_rx_stream(remote, rx, pip4, pip6);
             }
         });
 
@@ -559,68 +367,25 @@ impl IvLanState {
         }
 
         // Peer not found, establish a connection via iroh
-        let (endpoint, dev) = {
-            let state = self.inner.lock().await;
-            let endpoint = state
-                .endpoint
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Endpoint not initialized"))?
-                .clone();
-            let dev = state.dev.clone();
-
-            (endpoint, dev)
-        };
+        let endpoint = self
+            .inner
+            .lock()
+            .await
+            .endpoint
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Endpoint not initialized"))?
+            .clone();
 
         // Connect to the remote peer
         let conn = endpoint.connect(pk, b"ivlan/1.0").await?;
-        let (tx, mut rx) = conn.open_bi().await?;
+        let (tx, rx) = conn.open_bi().await?;
 
-        // Allocate addresses and store peer
-        let (peer_ipv4, peer_ipv6) = self.inner.lock().await.insert_peer(conn.remote_id(), tx)?;
+        // Allocate addresses and start recv stream
+        let mut inner = self.inner.lock().await;
+        let (pip4, pip6) = inner.insert_peer(conn.remote_id(), tx)?;
+        inner.start_rx_stream(conn.remote_id(), rx, pip4, pip6);
 
-        // Spawn task to handle incoming messages from this peer
-        let host_ipv4 = self.inner.lock().await.ipv4addr;
-        let host_ipv6 = self.inner.lock().await.ipv6addr;
-
-        tokio::spawn(async move {
-            let mut buf = vec![0; 65536];
-            loop {
-                match rx.read_u16_le().await {
-                    Ok(len) => {
-                        let len = len as usize;
-                        if rx.read_exact(&mut buf[..len]).await.is_err() {
-                            log::debug!("Peer {} closed connection", pk);
-                            break;
-                        }
-
-                        let patch = patch_packet_addresses(
-                            &mut buf[..len],
-                            len,
-                            peer_ipv4,
-                            peer_ipv6,
-                            host_ipv4,
-                            host_ipv6,
-                        )
-                        .unwrap();
-
-                        if let Some((src, dst)) = patch {
-                            let txd = dev.send(&buf[..len]).await.unwrap();
-                            log::trace!(
-                                "IV recv/1 src={pk}, payload={len} | PATCHED src={src}, dst={dst} | WR {txd}"
-                            );
-                        } else {
-                            log::debug!("IV recv/1 src={pk}, payload={len} | SKIP");
-                        }
-                    }
-                    Err(_) => {
-                        log::debug!("Peer {} closed connection", pk);
-                        break;
-                    }
-                }
-            }
-        });
-
-        Ok((peer_ipv4, peer_ipv6))
+        Ok((pip4, pip6))
     }
 }
 
