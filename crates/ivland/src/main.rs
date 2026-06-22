@@ -420,9 +420,13 @@ impl IvLanState {
                 };
 
                 let remote = conn.remote_id();
-                this.inner.lock().await.insert_peer(remote, tx).unwrap();
+                let (peer_ipv4, peer_ipv6, host_ipv4, host_ipv6) = {
+                    let mut inner = this.inner.lock().await;
+                    let (pip4, pip6) = inner.insert_peer(remote, tx).unwrap();
+                    let (hip4, hip6) = (inner.ipv4addr, inner.ipv6addr);
+                    (pip4, pip6, hip4, hip6)
+                };
 
-                let this_inner = Arc::clone(&this.inner);
                 let mut buf = vec![0; 65536];
                 let dev_ = Arc::clone(&dev_);
                 tokio::spawn(async move {
@@ -430,28 +434,18 @@ impl IvLanState {
                         let len = rx.read_u16_le().await.unwrap() as usize;
                         rx.read_exact(&mut buf[..len]).await.unwrap();
 
-                        let state = this_inner.lock().await;
-                        if let Some(peer) = state.peers.get(&remote) {
-                            let patch = patch_packet_addresses(
-                                &mut buf,
-                                len,
-                                peer.ipv4,
-                                peer.ipv6,
-                                state.ipv4addr,
-                                state.ipv6addr,
-                            )
-                            .unwrap();
+                        let patch = patch_packet_addresses(
+                            &mut buf, len, peer_ipv4, peer_ipv6, host_ipv4, host_ipv6,
+                        )
+                        .unwrap();
 
-                            if let Some((src, dst)) = patch {
-                                let txd = dev_.send(&buf[..len]).await.unwrap();
-                                log::trace!(
-                                    "IV recv/0 src={remote}, payload={len} | PATCHED src={src}, dst={dst} | WR {txd}"
-                                );
-                            } else {
-                                log::debug!("IV recv/0 src={remote}, payload={len} | SKIP");
-                            }
+                        if let Some((src, dst)) = patch {
+                            let txd = dev_.send(&buf[..len]).await.unwrap();
+                            log::trace!(
+                                "IV recv/0 src={remote}, payload={len} | PATCHED src={src}, dst={dst} | WR {txd}"
+                            );
                         } else {
-                            log::warn!("IV recv/0 src={remote}, payload={len} | PEER NOT FOUND");
+                            log::debug!("IV recv/0 src={remote}, payload={len} | SKIP");
                         }
                     }
                 });
