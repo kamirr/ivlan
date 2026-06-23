@@ -5,74 +5,95 @@ use ivlan_rpc::IpAddrs;
 
 pub const ROUTER_MULTICAST_ADDR: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x0002);
 
-fn calculate_checksum(data: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
-    for chunk in data.chunks(2) {
-        let word = if chunk.len() == 2 {
-            u16::from_be_bytes([chunk[0], chunk[1]])
-        } else {
-            (chunk[0] as u16) << 8
-        };
-        sum += word as u32;
-    }
-    while (sum >> 16) > 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !sum as u16
+fn csum_replace_16(checksum: u16, old: u16, new: u16) -> u16 {
+    let mut sum = (!checksum as u32 & 0xffff) + (!old as u32 & 0xffff) + (new as u32);
+
+    sum = (sum & 0xffff) + (sum >> 16);
+    sum = (sum & 0xffff) + (sum >> 16);
+
+    !(sum as u16)
 }
 
 fn recalculate_tcp_checksum_ipv4(
     buf: &mut [u8],
-    len: usize,
-    src: Ipv4Addr,
-    dst: Ipv4Addr,
+    old_src: Ipv4Addr,
+    old_dst: Ipv4Addr,
+    new_src: Ipv4Addr,
+    new_dst: Ipv4Addr,
     tcp_start: usize,
 ) {
-    let tcp_len = len - tcp_start;
+    let checksum_offset = tcp_start + 16;
+    let mut checksum = u16::from_be_bytes([buf[checksum_offset], buf[checksum_offset + 1]]);
 
-    // Zero out checksum field
-    buf[tcp_start + 16..tcp_start + 18].copy_from_slice(&[0, 0]);
+    // Replace each 16-bit word of old addresses with new addresses
+    let old_src_words = old_src.octets();
+    let old_dst_words = old_dst.octets();
+    let new_src_words = new_src.octets();
+    let new_dst_words = new_dst.octets();
 
-    // Build pseudo-header: src(4) + dst(4) + zero(1) + protocol(1) + tcp_len(2)
-    let mut pseudo = Vec::with_capacity(12 + tcp_len);
-    pseudo.extend_from_slice(&src.octets());
-    pseudo.extend_from_slice(&dst.octets());
-    pseudo.push(0);
-    pseudo.push(6); // TCP protocol
-    pseudo.extend_from_slice(&(tcp_len as u16).to_be_bytes());
-    pseudo.extend_from_slice(&buf[tcp_start..len]);
+    // Source address - two 16-bit words
+    let old_src_w1 = u16::from_be_bytes([old_src_words[0], old_src_words[1]]);
+    let new_src_w1 = u16::from_be_bytes([new_src_words[0], new_src_words[1]]);
+    checksum = csum_replace_16(checksum, old_src_w1, new_src_w1);
 
-    let checksum = calculate_checksum(&pseudo);
-    buf[tcp_start + 16..tcp_start + 18].copy_from_slice(&checksum.to_be_bytes());
+    let old_src_w2 = u16::from_be_bytes([old_src_words[2], old_src_words[3]]);
+    let new_src_w2 = u16::from_be_bytes([new_src_words[2], new_src_words[3]]);
+    checksum = csum_replace_16(checksum, old_src_w2, new_src_w2);
+
+    // Destination address - two 16-bit words
+    let old_dst_w1 = u16::from_be_bytes([old_dst_words[0], old_dst_words[1]]);
+    let new_dst_w1 = u16::from_be_bytes([new_dst_words[0], new_dst_words[1]]);
+    checksum = csum_replace_16(checksum, old_dst_w1, new_dst_w1);
+
+    let old_dst_w2 = u16::from_be_bytes([old_dst_words[2], old_dst_words[3]]);
+    let new_dst_w2 = u16::from_be_bytes([new_dst_words[2], new_dst_words[3]]);
+    checksum = csum_replace_16(checksum, old_dst_w2, new_dst_w2);
+
+    buf[checksum_offset..checksum_offset + 2].copy_from_slice(&checksum.to_be_bytes());
 }
 
 fn recalculate_udp_checksum_ipv4(
     buf: &mut [u8],
-    len: usize,
-    src: Ipv4Addr,
-    dst: Ipv4Addr,
+    old_src: Ipv4Addr,
+    old_dst: Ipv4Addr,
+    new_src: Ipv4Addr,
+    new_dst: Ipv4Addr,
     udp_start: usize,
 ) {
-    let udp_len = len - udp_start;
-
-    // Zero out checksum field (only if it's non-zero, IPv4 UDP can have 0 checksum)
     let checksum_offset = udp_start + 6;
+    let old_checksum = u16::from_be_bytes([buf[checksum_offset], buf[checksum_offset + 1]]);
 
-    // Build pseudo-header
-    let mut pseudo = Vec::with_capacity(12 + udp_len);
-    pseudo.extend_from_slice(&src.octets());
-    pseudo.extend_from_slice(&dst.octets());
-    pseudo.push(0);
-    pseudo.push(17); // UDP protocol
-    pseudo.extend_from_slice(&(udp_len as u16).to_be_bytes());
+    // For UDP, 0 means no checksum, so skip if it was 0
+    if old_checksum == 0 {
+        return;
+    }
 
-    // Save and zero checksum
-    let _saved_checksum = u16::from_be_bytes([buf[checksum_offset], buf[checksum_offset + 1]]);
-    buf[checksum_offset..checksum_offset + 2].copy_from_slice(&[0, 0]);
+    let mut checksum = old_checksum;
 
-    pseudo.extend_from_slice(&buf[udp_start..len]);
+    // Replace each 16-bit word of old addresses with new addresses
+    let old_src_words = old_src.octets();
+    let old_dst_words = old_dst.octets();
+    let new_src_words = new_src.octets();
+    let new_dst_words = new_dst.octets();
 
-    let mut checksum = calculate_checksum(&pseudo);
+    // Source address - two 16-bit words
+    let old_src_w1 = u16::from_be_bytes([old_src_words[0], old_src_words[1]]);
+    let new_src_w1 = u16::from_be_bytes([new_src_words[0], new_src_words[1]]);
+    checksum = csum_replace_16(checksum, old_src_w1, new_src_w1);
+
+    let old_src_w2 = u16::from_be_bytes([old_src_words[2], old_src_words[3]]);
+    let new_src_w2 = u16::from_be_bytes([new_src_words[2], new_src_words[3]]);
+    checksum = csum_replace_16(checksum, old_src_w2, new_src_w2);
+
+    // Destination address - two 16-bit words
+    let old_dst_w1 = u16::from_be_bytes([old_dst_words[0], old_dst_words[1]]);
+    let new_dst_w1 = u16::from_be_bytes([new_dst_words[0], new_dst_words[1]]);
+    checksum = csum_replace_16(checksum, old_dst_w1, new_dst_w1);
+
+    let old_dst_w2 = u16::from_be_bytes([old_dst_words[2], old_dst_words[3]]);
+    let new_dst_w2 = u16::from_be_bytes([new_dst_words[2], new_dst_words[3]]);
+    checksum = csum_replace_16(checksum, old_dst_w2, new_dst_w2);
+
     if checksum == 0 {
         checksum = 0xffff; // For IPv4, 0 means no checksum, so use 0xffff
     }
@@ -82,64 +103,81 @@ fn recalculate_udp_checksum_ipv4(
 
 fn recalculate_tcp_checksum_ipv6(
     buf: &mut [u8],
-    len: usize,
-    src: Ipv6Addr,
-    dst: Ipv6Addr,
+    old_src: Ipv6Addr,
+    old_dst: Ipv6Addr,
+    new_src: Ipv6Addr,
+    new_dst: Ipv6Addr,
     tcp_start: usize,
 ) {
-    let tcp_len = len - tcp_start;
+    let checksum_offset = tcp_start + 16;
+    let mut checksum = u16::from_be_bytes([buf[checksum_offset], buf[checksum_offset + 1]]);
 
-    // Zero out checksum field
-    buf[tcp_start + 16..tcp_start + 18].copy_from_slice(&[0, 0]);
+    // Replace each 16-bit word of old addresses with new addresses
+    let old_src_words = old_src.segments();
+    let old_dst_words = old_dst.segments();
+    let new_src_words = new_src.segments();
+    let new_dst_words = new_dst.segments();
 
-    // Build pseudo-header: src(16) + dst(16) + payload_len(4) + zeros(3) + next_header(1)
-    let mut pseudo = Vec::with_capacity(40 + tcp_len);
-    pseudo.extend_from_slice(&src.octets());
-    pseudo.extend_from_slice(&dst.octets());
-    pseudo.extend_from_slice(&(tcp_len as u32).to_be_bytes());
-    pseudo.extend_from_slice(&[0, 0, 0, 6]); // zeros + TCP protocol
-    pseudo.extend_from_slice(&buf[tcp_start..len]);
+    // Source address - 4 16-bit words
+    for i in 0..8 {
+        checksum = csum_replace_16(checksum, old_src_words[i], new_src_words[i]);
+    }
 
-    let checksum = calculate_checksum(&pseudo);
-    buf[tcp_start + 16..tcp_start + 18].copy_from_slice(&checksum.to_be_bytes());
+    // Destination address - 4 16-bit words
+    for i in 0..8 {
+        checksum = csum_replace_16(checksum, old_dst_words[i], new_dst_words[i]);
+    }
+
+    buf[checksum_offset..checksum_offset + 2].copy_from_slice(&checksum.to_be_bytes());
 }
 
 fn recalculate_udp_checksum_ipv6(
     buf: &mut [u8],
-    len: usize,
-    src: Ipv6Addr,
-    dst: Ipv6Addr,
+    old_src: Ipv6Addr,
+    old_dst: Ipv6Addr,
+    new_src: Ipv6Addr,
+    new_dst: Ipv6Addr,
     udp_start: usize,
 ) {
-    let udp_len = len - udp_start;
     let checksum_offset = udp_start + 6;
+    let old_checksum = u16::from_be_bytes([buf[checksum_offset], buf[checksum_offset + 1]]);
 
-    // Build pseudo-header
-    let mut pseudo = Vec::with_capacity(40 + udp_len);
-    pseudo.extend_from_slice(&src.octets());
-    pseudo.extend_from_slice(&dst.octets());
-    pseudo.extend_from_slice(&(udp_len as u32).to_be_bytes());
-    pseudo.extend_from_slice(&[0, 0, 0, 17]); // zeros + UDP protocol
+    // IPv6 UDP always requires checksum, but skip if it's 0 (shouldn't happen)
+    if old_checksum == 0 {
+        return;
+    }
 
-    // Zero checksum
-    buf[checksum_offset..checksum_offset + 2].copy_from_slice(&[0, 0]);
+    let mut checksum = old_checksum;
 
-    pseudo.extend_from_slice(&buf[udp_start..len]);
+    // Replace each 16-bit word of old addresses with new addresses
+    let old_src_words = old_src.segments();
+    let old_dst_words = old_dst.segments();
+    let new_src_words = new_src.segments();
+    let new_dst_words = new_dst.segments();
 
-    let checksum = calculate_checksum(&pseudo);
-    let checksum = if checksum == 0 { 0xffff } else { checksum };
+    // Source address - 4 16-bit words
+    for i in 0..8 {
+        checksum = csum_replace_16(checksum, old_src_words[i], new_src_words[i]);
+    }
+
+    // Destination address - 4 16-bit words
+    for i in 0..8 {
+        checksum = csum_replace_16(checksum, old_dst_words[i], new_dst_words[i]);
+    }
+
+    if checksum == 0 {
+        checksum = 0xffff;
+    }
+
     buf[checksum_offset..checksum_offset + 2].copy_from_slice(&checksum.to_be_bytes());
 }
 
 pub fn patch_packet_addresses(
     buf: &mut [u8],
-    len: usize,
     src: IpAddrs,
     dst: IpAddrs,
 ) -> anyhow::Result<Option<(IpAddr, IpAddr)>> {
-    let Ok(SlicedPacket { net, .. }) = SlicedPacket::from_ip(&buf[..len]) else {
-        anyhow::bail!("Bad packet");
-    };
+    let net = SlicedPacket::from_ip(&buf)?.net;
 
     match net {
         Some(NetSlice::Ipv4(ipv4)) => {
@@ -150,30 +188,63 @@ pub fn patch_packet_addresses(
             let dst_offset = 16;
             let checksum_offset = 10;
 
+            // Capture old addresses before modification
+            let old_src = Ipv4Addr::new(
+                buf[src_offset],
+                buf[src_offset + 1],
+                buf[src_offset + 2],
+                buf[src_offset + 3],
+            );
+            let old_dst = Ipv4Addr::new(
+                buf[dst_offset],
+                buf[dst_offset + 1],
+                buf[dst_offset + 2],
+                buf[dst_offset + 3],
+            );
+
+            // Update addresses
             buf[src_offset..src_offset + 4].copy_from_slice(&src.v4.octets());
             buf[dst_offset..dst_offset + 4].copy_from_slice(&dst.v4.octets());
-            buf[checksum_offset..checksum_offset + 2].copy_from_slice(&[0, 0]);
 
-            let mut sum: u32 = 0;
-            for i in (0..header_len).step_by(2) {
-                let word = u16::from_be_bytes([buf[i], buf[i + 1]]);
-                sum += word as u32;
-            }
-            while (sum >> 16) > 0 {
-                sum = (sum & 0xffff) + (sum >> 16);
-            }
-            let checksum = !sum as u16;
+            // Incrementally update IPv4 header checksum
+            let mut checksum = u16::from_be_bytes([buf[checksum_offset], buf[checksum_offset + 1]]);
+
+            // Replace each 16-bit word
+            let old_src_bytes = old_src.octets();
+            let new_src_bytes = src.v4.octets();
+            let old_src_w1 = u16::from_be_bytes([old_src_bytes[0], old_src_bytes[1]]);
+            let new_src_w1 = u16::from_be_bytes([new_src_bytes[0], new_src_bytes[1]]);
+            checksum = csum_replace_16(checksum, old_src_w1, new_src_w1);
+
+            let old_src_w2 = u16::from_be_bytes([old_src_bytes[2], old_src_bytes[3]]);
+            let new_src_w2 = u16::from_be_bytes([new_src_bytes[2], new_src_bytes[3]]);
+            checksum = csum_replace_16(checksum, old_src_w2, new_src_w2);
+
+            let old_dst_bytes = old_dst.octets();
+            let new_dst_bytes = dst.v4.octets();
+            let old_dst_w1 = u16::from_be_bytes([old_dst_bytes[0], old_dst_bytes[1]]);
+            let new_dst_w1 = u16::from_be_bytes([new_dst_bytes[0], new_dst_bytes[1]]);
+            checksum = csum_replace_16(checksum, old_dst_w1, new_dst_w1);
+
+            let old_dst_w2 = u16::from_be_bytes([old_dst_bytes[2], old_dst_bytes[3]]);
+            let new_dst_w2 = u16::from_be_bytes([new_dst_bytes[2], new_dst_bytes[3]]);
+            checksum = csum_replace_16(checksum, old_dst_w2, new_dst_w2);
+
             buf[checksum_offset..checksum_offset + 2].copy_from_slice(&checksum.to_be_bytes());
 
             // Recalculate TCP/UDP checksums if present
             match protocol {
                 6 => {
                     // TCP
-                    recalculate_tcp_checksum_ipv4(buf, len, src.v4, dst.v4, header_len);
+                    recalculate_tcp_checksum_ipv4(
+                        buf, old_src, old_dst, src.v4, dst.v4, header_len,
+                    );
                 }
                 17 => {
                     // UDP
-                    recalculate_udp_checksum_ipv4(buf, len, src.v4, dst.v4, header_len);
+                    recalculate_udp_checksum_ipv4(
+                        buf, old_src, old_dst, src.v4, dst.v4, header_len,
+                    );
                 }
                 _ => {}
             }
@@ -185,6 +256,14 @@ pub fn patch_packet_addresses(
             let dst_offset = 24;
             let next_header = ipv6.header().next_header().0;
 
+            // Capture old addresses before modification
+            let mut old_src_bytes = [0u8; 16];
+            let mut old_dst_bytes = [0u8; 16];
+            old_src_bytes.copy_from_slice(&buf[src_offset..src_offset + 16]);
+            old_dst_bytes.copy_from_slice(&buf[dst_offset..dst_offset + 16]);
+            let old_src = Ipv6Addr::from(old_src_bytes);
+            let old_dst = Ipv6Addr::from(old_dst_bytes);
+
             buf[src_offset..src_offset + 16].copy_from_slice(&src.v6.octets());
             buf[dst_offset..dst_offset + 16].copy_from_slice(&dst.v6.octets());
 
@@ -194,11 +273,25 @@ pub fn patch_packet_addresses(
             match next_header {
                 6 => {
                     // TCP
-                    recalculate_tcp_checksum_ipv6(buf, len, src.v6, dst.v6, transport_start);
+                    recalculate_tcp_checksum_ipv6(
+                        buf,
+                        old_src,
+                        old_dst,
+                        src.v6,
+                        dst.v6,
+                        transport_start,
+                    );
                 }
                 17 => {
                     // UDP
-                    recalculate_udp_checksum_ipv6(buf, len, src.v6, dst.v6, transport_start);
+                    recalculate_udp_checksum_ipv6(
+                        buf,
+                        old_src,
+                        old_dst,
+                        src.v6,
+                        dst.v6,
+                        transport_start,
+                    );
                 }
                 _ => {}
             }

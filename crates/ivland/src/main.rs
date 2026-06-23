@@ -137,8 +137,20 @@ impl IvLanStateInner {
                 let len = rx.read_u16_le().await.unwrap() as usize;
                 rx.read_exact(&mut buf[..len]).await.unwrap();
 
-                let patch =
-                    ip_util::patch_packet_addresses(&mut buf, len, peer_addrs, host_addrs).unwrap();
+                let patch = match ip_util::patch_packet_addresses(
+                    &mut buf[..len],
+                    peer_addrs,
+                    host_addrs,
+                ) {
+                    Ok(patch) => patch,
+                    Err(e) => {
+                        log::warn!("IV recv/0 src={remote}, payload={len} | BAD PACKET | {e}");
+                        if len == 0 {
+                            panic!();
+                        }
+                        continue;
+                    }
+                };
 
                 if let Some((src, dst)) = patch {
                     let txd = dev.send(&buf[..len]).await.unwrap();
@@ -237,7 +249,7 @@ impl IvLanState {
         tokio::spawn(async move {
             let mut buf = vec![0; 65536];
             loop {
-                let len = state.dev.recv(&mut buf).await.unwrap() as u16;
+                let len: u16 = state.dev.recv(&mut buf).await.unwrap().try_into().unwrap();
 
                 let Ok(SlicedPacket { net: Some(net), .. }) = SlicedPacket::from_ip(&buf) else {
                     log::warn!("Bad packet received");
@@ -250,7 +262,7 @@ impl IvLanState {
                         let peer = state.peers.iter_mut().find(|peer| peer.addrs.v4 == dst);
 
                         if let Some(mut peer) = peer {
-                            peer.tx.write(&len.to_le_bytes()).await.unwrap();
+                            peer.tx.write_all(&len.to_le_bytes()).await.unwrap();
                             peer.tx.write_all(&buf[..len as usize]).await.unwrap();
 
                             log::trace!(
