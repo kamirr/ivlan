@@ -5,6 +5,7 @@ use std::{
 };
 
 use clap::Parser;
+use ivlan_rpc::RemoteId;
 use serde::{Deserialize, Serialize};
 use tarpc::tokio_serde::formats::Json;
 
@@ -20,8 +21,7 @@ struct Config {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PeerData {
-    #[serde(with = "util::pk_serde")]
-    pk: iroh_base::PublicKey,
+    pk: RemoteId,
 }
 
 impl Config {
@@ -66,10 +66,10 @@ enum Command {
     },
     Init,
     Connect {
-        remote: iroh_base::PublicKey,
+        remote: RemoteId,
     },
     Lookup {
-        remote: iroh_base::PublicKey,
+        remote: RemoteId,
     },
     Peers,
 }

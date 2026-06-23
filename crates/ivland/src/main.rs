@@ -9,11 +9,8 @@ use std::{
 use clap::Parser;
 use etherparse::{ArpOperation, NetSlice, SlicedPacket};
 use futures::StreamExt as _;
-use iroh::{
-    PublicKey,
-    endpoint::{RecvStream, SendStream},
-};
-use ivlan_rpc::{IpAddrs, IvLanService};
+use iroh::endpoint::{RecvStream, SendStream};
+use ivlan_rpc::{IpAddrs, IvLanService, RemoteId};
 use tarpc::{
     server::{Channel as _, incoming::Incoming as _},
     tokio_serde::formats::Json,
@@ -30,14 +27,14 @@ struct IvLanStateInner {
     running: bool,
     dev: Arc<AsyncDevice>,
     endpoint: Option<Arc<iroh::Endpoint>>,
-    peers: BTreeMap<PublicKey, Peer>,
+    peers: BTreeMap<RemoteId, Peer>,
     addrs: IpAddrs,
     ipv4mask: u8,
     ipv6mask: u8,
 }
 
 impl IvLanStateInner {
-    fn insert_peer(&mut self, remote: PublicKey, tx: SendStream) -> anyhow::Result<IpAddrs> {
+    fn insert_peer(&mut self, remote: RemoteId, tx: SendStream) -> anyhow::Result<IpAddrs> {
         if let Some(Peer { addrs, .. }) = self.peers.get(&remote) {
             return Ok(*addrs);
         }
@@ -128,7 +125,7 @@ impl IvLanStateInner {
         None
     }
 
-    fn start_rx_stream(&mut self, remote: PublicKey, rx: RecvStream, peer_addrs: IpAddrs) {
+    fn start_rx_stream(&mut self, remote: RemoteId, rx: RecvStream, peer_addrs: IpAddrs) {
         let host_addrs = self.addrs;
         let mut buf = vec![0; 65536];
         let mut rx = rx;
@@ -198,7 +195,7 @@ impl IvLanState {
             state.dev.clone()
         };
 
-        log::info!("Start IVLAN as {}.", sk.public());
+        log::info!("Start IVLAN as {}.", RemoteId::from(sk.public()));
 
         let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
             .alpns(vec![b"ivlan/1.0".to_vec()])
@@ -237,8 +234,7 @@ impl IvLanState {
                     }
                 };
 
-                let remote = conn.remote_id();
-
+                let remote = conn.remote_id().into();
                 let mut inner = this.inner.lock().await;
                 let peer_addrs = inner.insert_peer(remote, tx).unwrap();
                 inner.start_rx_stream(remote, rx, peer_addrs);
@@ -291,7 +287,7 @@ impl IvLanState {
                     NetSlice::Ipv6(ipv6) => {
                         let dst = ipv6.header().destination_addr();
 
-                        if dst == Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x0002) {
+                        if dst == ip_util::ROUTER_MULTICAST_ADDR {
                             log::trace!(
                                 "IPv6 src={}, dst={}, payload={}, len={} | SKIP",
                                 ipv6.header().source_addr(),
@@ -348,10 +344,10 @@ impl IvLanState {
     async fn connect_impl(
         self,
         _cx: tarpc::context::Context,
-        pk: iroh::PublicKey,
+        remote: RemoteId,
     ) -> anyhow::Result<IpAddrs> {
         let mut state = self.inner.lock().await;
-        if let Some(peer) = state.peers.get(&pk) {
+        if let Some(peer) = state.peers.get(&remote) {
             return Ok(peer.addrs);
         }
 
@@ -363,12 +359,13 @@ impl IvLanState {
             .clone();
 
         // Connect to the remote peer
+        let pk: iroh::PublicKey = remote.into();
         let conn = endpoint.connect(pk, b"ivlan/1.0").await?;
         let (tx, rx) = conn.open_bi().await?;
 
         // Allocate addresses and start recv stream
-        let peer_addrs = state.insert_peer(conn.remote_id(), tx)?;
-        state.start_rx_stream(conn.remote_id(), rx, peer_addrs);
+        let peer_addrs = state.insert_peer(conn.remote_id().into(), tx)?;
+        state.start_rx_stream(conn.remote_id().into(), rx, peer_addrs);
 
         Ok(peer_addrs)
     }
@@ -376,17 +373,17 @@ impl IvLanState {
     async fn lookup_impl(
         self,
         _cx: tarpc::context::Context,
-        pk: iroh::PublicKey,
+        remote: RemoteId,
     ) -> anyhow::Result<IpAddrs> {
         let state = self.inner.lock().await;
-        if let Some(peer) = state.peers.get(&pk) {
+        if let Some(peer) = state.peers.get(&remote) {
             Ok(peer.addrs)
         } else {
             anyhow::bail!("Peer not connected")
         }
     }
 
-    async fn peers_impl(self, _cx: tarpc::context::Context) -> BTreeMap<iroh::PublicKey, IpAddrs> {
+    async fn peers_impl(self, _cx: tarpc::context::Context) -> BTreeMap<RemoteId, IpAddrs> {
         self.inner
             .lock()
             .await
@@ -405,20 +402,24 @@ impl IvLanService for IvLanState {
     async fn connect(
         self,
         cx: tarpc::context::Context,
-        pk: iroh::PublicKey,
+        remote: RemoteId,
     ) -> Result<IpAddrs, String> {
-        self.connect_impl(cx, pk).await.map_err(|e| e.to_string())
+        self.connect_impl(cx, remote)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     async fn lookup(
         self,
         cx: tarpc::context::Context,
-        pk: iroh::PublicKey,
+        remote: RemoteId,
     ) -> Result<IpAddrs, String> {
-        self.lookup_impl(cx, pk).await.map_err(|e| e.to_string())
+        self.lookup_impl(cx, remote)
+            .await
+            .map_err(|e| e.to_string())
     }
 
-    async fn peers(self, cx: tarpc::context::Context) -> BTreeMap<iroh::PublicKey, IpAddrs> {
+    async fn peers(self, cx: tarpc::context::Context) -> BTreeMap<RemoteId, IpAddrs> {
         self.peers_impl(cx).await
     }
 }

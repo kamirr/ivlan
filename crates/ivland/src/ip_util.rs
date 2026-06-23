@@ -3,6 +3,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use etherparse::{NetSlice, SlicedPacket};
 use ivlan_rpc::IpAddrs;
 
+pub const ROUTER_MULTICAST_ADDR: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x0002);
+
 fn calculate_checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     for chunk in data.chunks(2) {
