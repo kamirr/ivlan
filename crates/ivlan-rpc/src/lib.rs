@@ -14,7 +14,7 @@ pub struct IpAddrs {
     pub v6: Ipv6Addr,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RemoteId(iroh::PublicKey);
 
 impl From<RemoteId> for iroh::PublicKey {

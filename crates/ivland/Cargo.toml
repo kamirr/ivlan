@@ -6,10 +6,12 @@ edition = "2024"
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+dashmap = "6.2.1"
 dotenv = { workspace = true }
 env_logger = "0.11.10"
 etherparse = "0.20.2"
 futures = { workspace = true }
+fxhash = "0.2.1"
 iroh = { workspace = true }
 ivlan-rpc = { path = "../ivlan-rpc" }
 log = { workspace = true }
