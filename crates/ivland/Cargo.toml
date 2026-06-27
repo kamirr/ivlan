@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+ctrlc = "3.5.2"
 dashmap = "6.2.1"
 dotenv = { workspace = true }
 env_logger = "0.11.10"

@@ -25,6 +25,7 @@ use tokio::{
     sync::{
         Mutex,
         mpsc::{self, error::TrySendError},
+        oneshot,
     },
     task::AbortHandle,
     time::{Duration, sleep},
@@ -495,23 +496,7 @@ impl IvLanState {
             return Ok(peer.addrs);
         }
 
-        let endpoint = self
-            .inner
-            .endpoint
-            .get()
-            .ok_or_else(|| anyhow::anyhow!("Endpoint not initialized"))?
-            .clone();
-
-        let pk: iroh::PublicKey = remote.into();
-        let conn = endpoint.connect(pk, b"ivlan/1.0").await?;
-        let txrx = conn.open_bi().await?;
-
-        let peer_addrs = self
-            .inner
-            .clone()
-            .insert_peer(conn.remote_id().into(), Some(txrx))
-            .await?;
-
+        let peer_addrs = self.inner.clone().insert_peer(remote, None).await?;
         Ok(peer_addrs)
     }
 
@@ -626,6 +611,40 @@ async fn main() -> anyhow::Result<()> {
         args.ip6mask,
         args.out_queue,
     );
+
+    let (exit_tx, exit_rx) = oneshot::channel::<()>();
+
+    let state_ = state.inner.clone();
+    tokio::task::spawn(async move {
+        match exit_rx.await {
+            Ok(()) => {
+                for mut peer in state_.peers.iter_mut() {
+                    if let Some(prev) = peer.rx_task.take() {
+                        prev.abort();
+                    }
+                }
+                if let Some(endpoint) = state_.endpoint.get() {
+                    log::info!("Closing Iroh endpoint.");
+                    endpoint.close().await;
+                }
+                std::process::exit(0);
+            }
+            Err(_) => unreachable!(),
+        }
+    });
+
+    let mut exit_tx = Some(exit_tx);
+    ctrlc::set_handler(move || match exit_tx.take() {
+        Some(tx) => {
+            log::info!("Exiting gracefully. Press Ctrl+C again to force exit.");
+            if tx.send(()).is_err() {
+                log::warn!("Graceful exit failed.");
+                std::process::exit(1)
+            }
+        }
+        None => std::process::exit(0),
+    })
+    .expect("Error setting Ctrl-C handler");
 
     // JSON transport is provided by the json_transport tarpc module. It makes it easy
     // to start up a serde-powered json serialization strategy over TCP.
