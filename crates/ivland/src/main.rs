@@ -22,21 +22,21 @@ use tarpc::{
 };
 use tokio::{
     io::AsyncReadExt as _,
-    sync::{Mutex, mpsc},
+    sync::{
+        Mutex,
+        mpsc::{self, error::TrySendError},
+    },
     task::AbortHandle,
     time::{Duration, sleep},
 };
 use tun_rs::{AsyncDevice, DeviceBuilder};
-
-const MAX_QUEUE_BYTES: usize = 1 << 20;
 
 type OutboundMessage = Vec<u8>;
 
 struct Peer {
     addrs: IpAddrs,
     send: Arc<Mutex<Option<SendStream>>>,
-    queue_tx: mpsc::UnboundedSender<OutboundMessage>,
-    queue_size: Arc<AtomicUsize>,
+    queue_tx: mpsc::Sender<OutboundMessage>,
     rx_task: Option<AbortHandle>,
 }
 
@@ -48,6 +48,7 @@ struct IvLanStateInner {
     addrs: IpAddrs,
     ipv4mask: u8,
     ipv6mask: u8,
+    out_queue_cap: usize,
 }
 
 impl IvLanStateInner {
@@ -70,7 +71,7 @@ impl IvLanStateInner {
             return Ok(peer.addrs);
         }
 
-        let (queue_tx, queue_rx) = mpsc::unbounded_channel();
+        let (queue_tx, queue_rx) = mpsc::channel(self.out_queue_cap);
         let queue_size = Arc::new(AtomicUsize::new(0));
         let send = Arc::new(Mutex::new(None));
         self.clone()
@@ -114,7 +115,6 @@ impl IvLanStateInner {
                 addrs,
                 send,
                 queue_tx,
-                queue_size,
                 rx_task,
             },
         );
@@ -125,7 +125,7 @@ impl IvLanStateInner {
         self: Arc<Self>,
         remote: RemoteId,
         send: Arc<Mutex<Option<SendStream>>>,
-        mut queue_rx: mpsc::UnboundedReceiver<OutboundMessage>,
+        mut queue_rx: mpsc::Receiver<OutboundMessage>,
         queue_size: Arc<AtomicUsize>,
     ) {
         tokio::spawn(async move {
@@ -290,6 +290,7 @@ impl IvLanState {
         ipv4mask: u8,
         ipv6: Ipv6Addr,
         ipv6mask: u8,
+        out_queue_cap: usize,
     ) -> Self {
         IvLanState {
             inner: Arc::new(IvLanStateInner {
@@ -300,6 +301,7 @@ impl IvLanState {
                 addrs: IpAddrs { v4: ipv4, v6: ipv6 },
                 ipv4mask,
                 ipv6mask,
+                out_queue_cap,
             }),
         }
     }
@@ -377,46 +379,29 @@ impl IvLanState {
                             let mut msg = Vec::with_capacity(2 + len as usize);
                             msg.extend_from_slice(&len.to_le_bytes());
                             msg.extend_from_slice(&buf[..len as usize]);
-                            let msg_len = msg.len();
 
-                            let mut current = peer.queue_size.load(Ordering::Acquire);
-                            loop {
-                                if current + msg_len > MAX_QUEUE_BYTES {
-                                    log::warn!(
-                                        "Dropping outbound packet to {}: queue full ({} bytes)",
-                                        peer.key(),
-                                        current
-                                    );
-                                    break;
-                                }
-
-                                match peer.queue_size.compare_exchange(
-                                    current,
-                                    current + msg_len,
-                                    Ordering::AcqRel,
-                                    Ordering::Acquire,
-                                ) {
-                                    Ok(_) => {
-                                        if peer.queue_tx.send(msg).is_err() {
-                                            peer.queue_size.fetch_sub(msg_len, Ordering::AcqRel);
-                                            log::warn!(
-                                                "Failed to enqueue packet for peer {}",
-                                                peer.key()
-                                            );
-                                        } else {
-                                            log::trace!(
-                                                "IPv4 src={}, dst={}, payload={}, len={} | QUEUED {}",
-                                                ipv4.header().source_addr(),
-                                                ipv4.header().destination_addr(),
-                                                ipv4.payload().payload.len(),
-                                                len,
-                                                peer.key()
-                                            );
-                                        }
+                            if let Err(e) = peer.queue_tx.try_send(msg) {
+                                match e {
+                                    TrySendError::Full(_) => {
+                                        log::warn!(
+                                            "Dropping outbound packet to {}: queue full",
+                                            peer.key(),
+                                        );
+                                    }
+                                    TrySendError::Closed(_) => {
+                                        log::warn!("Outbound queue to {} closed", peer.key());
                                         break;
                                     }
-                                    Err(next) => current = next,
                                 }
+                            } else {
+                                log::trace!(
+                                    "IPv4 src={}, dst={}, payload={}, len={} | QUEUED {}",
+                                    ipv4.header().source_addr(),
+                                    ipv4.header().destination_addr(),
+                                    ipv4.payload().payload.len(),
+                                    len,
+                                    peer.key()
+                                );
                             }
                         } else {
                             log::debug!(
@@ -448,46 +433,29 @@ impl IvLanState {
                             let mut msg = Vec::with_capacity(2 + len as usize);
                             msg.extend_from_slice(&len.to_le_bytes());
                             msg.extend_from_slice(&buf[..len as usize]);
-                            let msg_len = msg.len();
 
-                            let mut current = peer.queue_size.load(Ordering::Acquire);
-                            loop {
-                                if current + msg_len > MAX_QUEUE_BYTES {
-                                    log::warn!(
-                                        "Dropping outbound packet to {}: queue full ({} bytes)",
-                                        peer.key(),
-                                        current
-                                    );
-                                    break;
-                                }
-
-                                match peer.queue_size.compare_exchange(
-                                    current,
-                                    current + msg_len,
-                                    Ordering::AcqRel,
-                                    Ordering::Acquire,
-                                ) {
-                                    Ok(_) => {
-                                        if peer.queue_tx.send(msg).is_err() {
-                                            peer.queue_size.fetch_sub(msg_len, Ordering::AcqRel);
-                                            log::warn!(
-                                                "Failed to enqueue packet for peer {}",
-                                                peer.key()
-                                            );
-                                        } else {
-                                            log::trace!(
-                                                "IPv6 src={}, dst={}, payload={}, len={} | QUEUED {}",
-                                                ipv6.header().source_addr(),
-                                                ipv6.header().destination_addr(),
-                                                ipv6.payload().payload.len(),
-                                                len,
-                                                peer.key()
-                                            );
-                                        }
+                            if let Err(e) = peer.queue_tx.try_send(msg) {
+                                match e {
+                                    TrySendError::Full(_) => {
+                                        log::warn!(
+                                            "Dropping outbound packet to {}: queue full",
+                                            peer.key(),
+                                        );
+                                    }
+                                    TrySendError::Closed(_) => {
+                                        log::warn!("Outbound queue to {} closed", peer.key());
                                         break;
                                     }
-                                    Err(next) => current = next,
                                 }
+                            } else {
+                                log::trace!(
+                                    "IPv6 src={}, dst={}, payload={}, len={} | QUEUED {}",
+                                    ipv6.header().source_addr(),
+                                    ipv6.header().destination_addr(),
+                                    ipv6.payload().payload.len(),
+                                    len,
+                                    peer.key()
+                                );
                             }
                         } else {
                             log::debug!(
@@ -600,22 +568,35 @@ impl IvLanService for IvLanState {
 
 #[derive(clap::Parser)]
 struct Args {
+    /// Interface name for the TUN device
     #[arg(env = "IV_IF_NAME", default_value = "iv")]
     if_name: String,
 
+    /// RPC server address
     #[clap(long, env = "IV_RPC_ADDR", default_value = "127.0.0.1:2334")]
     rpc_addr: SocketAddr,
 
+    /// MTU (Maximum Transmission Unit) size
     #[arg(long, env = "IV_MTU", default_value_t = 1500)]
     mtu: u16,
 
+    /// Maximum number of IP packets in the outbound queue per peer
+    #[arg(long, env = "IV_OUT_QUEUE", default_value_t = 64)]
+    out_queue: usize,
+
+    /// IPv4 address for the interface
     #[arg(long, env = "IV_IP4_ADDR", default_value = "121.37.0.0")]
     ip4: Ipv4Addr,
+
+    /// IPv4 subnet mask (CIDR notation)
     #[arg(long, env = "IV_IP4_MASK", default_value_t = 24)]
     ip4mask: u8,
 
+    /// IPv6 address for the interface
     #[arg(long, env = "IV_IP6_ADDR", default_value = "fd00::1")]
     ip6: Ipv6Addr,
+
+    /// IPv6 subnet mask (CIDR notation)
     #[arg(long, env = "IV_IP6_MASK", default_value_t = 64)]
     ip6mask: u8,
 }
@@ -637,7 +618,14 @@ async fn main() -> anyhow::Result<()> {
         .ipv6(args.ip6, args.ip6mask);
 
     let dev = builder.build_async()?;
-    let state = IvLanState::new(dev, args.ip4, args.ip4mask, args.ip6, args.ip6mask);
+    let state = IvLanState::new(
+        dev,
+        args.ip4,
+        args.ip4mask,
+        args.ip6,
+        args.ip6mask,
+        args.out_queue,
+    );
 
     // JSON transport is provided by the json_transport tarpc module. It makes it easy
     // to start up a serde-powered json serialization strategy over TCP.
