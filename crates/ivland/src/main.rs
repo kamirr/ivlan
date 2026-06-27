@@ -64,7 +64,8 @@ impl IvLanStateInner {
                 let mut send_guard = peer.send.lock().await;
                 *send_guard = Some(tx);
                 drop(send_guard);
-                peer.rx_task = Some(self.start_recv_task(remote, rx, peer.addrs));
+                peer.rx_task =
+                    Some(self.start_recv_task(remote, rx, peer.send.clone(), peer.addrs));
             }
             return Ok(peer.addrs);
         }
@@ -100,7 +101,7 @@ impl IvLanStateInner {
         let rx_task = if let Some((tx, rx)) = txrx {
             let mut send_guard = send.lock().await;
             *send_guard = Some(tx);
-            Some(self.start_recv_task(remote, rx, addrs))
+            Some(self.start_recv_task(remote, rx, send.clone(), addrs))
         } else {
             None
         };
@@ -160,6 +161,7 @@ impl IvLanStateInner {
         &self,
         remote: RemoteId,
         rx: RecvStream,
+        tx: Arc<Mutex<Option<SendStream>>>,
         peer_addrs: IpAddrs,
     ) -> AbortHandle {
         let host_addrs = self.addrs;
@@ -169,8 +171,17 @@ impl IvLanStateInner {
 
         tokio::spawn(async move {
             loop {
-                let len = rx.read_u16_le().await.unwrap() as usize;
-                rx.read_exact(&mut buf[..len]).await.unwrap();
+                let len: usize = match rx.read_u16_le().await {
+                    Ok(len) => len.into(),
+                    Err(e) => {
+                        log::info!("IV recv src={remote} | ERROR | {e}");
+                        break;
+                    },
+                };
+                if let Err(e) = rx.read_exact(&mut buf[..len]).await {
+                    log::info!("IV recv src={remote} | ERROR | {e}");
+                    break;
+                }
 
                 let patch = match ip_util::patch_packet_addresses(
                     &mut buf[..len],
@@ -196,6 +207,10 @@ impl IvLanStateInner {
                     log::debug!("IV recv src={remote}, payload={len} | SKIP");
                 }
             }
+
+            // Delete the corresponding sender to ensure that
+            // the connection is dropped or in a bad state ASAP.
+            *tx.lock().await = None;
         }).abort_handle()
     }
 
