@@ -131,10 +131,23 @@ impl std::error::Error for RemoteIdParseError {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum Auth {
     None,
     Password(String),
+}
+
+impl std::fmt::Debug for Auth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Auth::None => "none",
+                Auth::Password(_) => "password(redacted)",
+            }
+        )
+    }
 }
 
 #[tarpc::service]

@@ -41,6 +41,11 @@ struct Peer {
     rx_task: Option<AbortHandle>,
 }
 
+struct AuthRules {
+    anybody: bool,
+    password: Option<String>,
+}
+
 struct IvLanStateInner {
     running: Mutex<bool>,
     dev: Arc<AsyncDevice>,
@@ -50,6 +55,7 @@ struct IvLanStateInner {
     ipv4mask: u8,
     ipv6mask: u8,
     out_queue_cap: usize,
+    auth_rules: AuthRules,
 }
 
 impl IvLanStateInner {
@@ -329,6 +335,7 @@ impl IvLanState {
         ipv6: Ipv6Addr,
         ipv6mask: u8,
         out_queue_cap: usize,
+        auth_rules: AuthRules,
     ) -> Self {
         IvLanState {
             inner: Arc::new(IvLanStateInner {
@@ -340,6 +347,7 @@ impl IvLanState {
                 ipv4mask,
                 ipv6mask,
                 out_queue_cap,
+                auth_rules,
             }),
         }
     }
@@ -401,9 +409,31 @@ impl IvLanState {
                 };
 
                 log::info!("Auth from {}: {:?}", conn.remote_id(), auth);
-                if let Err(e) = auth::write_auth_resp(&AuthResp::Ok, &mut txrx.0).await {
+
+                let resp = if state.auth_rules.anybody {
+                    AuthResp::Ok
+                } else {
+                    if let Some(allow_pass) = &state.auth_rules.password
+                        && let Auth::Password(user_pass) = &auth
+                        && allow_pass == user_pass
+                    {
+                        AuthResp::Ok
+                    } else {
+                        AuthResp::Bad
+                    }
+                };
+
+                if let Err(e) = auth::write_auth_resp(&resp, &mut txrx.0).await {
                     log::warn!("Couldn't send auth response to {}: {}", conn.remote_id(), e);
                     continue;
+                }
+
+                match resp {
+                    AuthResp::Ok => {}
+                    AuthResp::Bad => {
+                        log::warn!("Peer {} rejected: bad auth", conn.remote_id());
+                        continue;
+                    }
                 }
 
                 let remote = conn.remote_id().into();
@@ -641,6 +671,21 @@ struct Args {
     /// IPv6 subnet mask (CIDR notation)
     #[arg(long, env = "IV_IP6_MASK", default_value_t = 64)]
     ip6mask: u8,
+
+    #[command(flatten)]
+    auth: AuthArgs,
+}
+
+#[derive(clap::Parser)]
+struct AuthArgs {
+    #[arg(
+        long = "allow-anybody",
+        env = "IV_AUTH_ANYBODY",
+        default_value_t = false
+    )]
+    anybody: bool,
+    #[arg(long = "allow-password", env = "IV_AUTH_PASSWORD")]
+    password: Option<String>,
 }
 
 async fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
@@ -667,6 +712,10 @@ async fn main() -> anyhow::Result<()> {
         args.ip6,
         args.ip6mask,
         args.out_queue,
+        AuthRules {
+            anybody: args.auth.anybody,
+            password: args.auth.password,
+        },
     );
 
     let (exit_tx, exit_rx) = oneshot::channel::<()>();
