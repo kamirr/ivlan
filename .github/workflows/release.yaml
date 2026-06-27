@@ -41,7 +41,7 @@ jobs:
       - name: Package binaries
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/ivlan-cli dist/ivlan
+          cp target/${{ matrix.target }}/release/ivlan dist/ivlan
           cp target/${{ matrix.target }}/release/ivland dist/ivland
           strip dist/ivlan || true
           strip dist/ivland || true
@@ -85,7 +85,7 @@ jobs:
       - name: Package
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/ivlan-cli dist/ivlan
+          cp target/${{ matrix.target }}/release/ivlan dist/ivlan
           cp target/${{ matrix.target }}/release/ivland dist/ivland
           strip dist/ivlan || true
           strip dist/ivland || true
