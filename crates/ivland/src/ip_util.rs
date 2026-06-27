@@ -177,7 +177,7 @@ pub fn patch_packet_addresses(
     src: IpAddrs,
     dst: IpAddrs,
 ) -> anyhow::Result<Option<(IpAddr, IpAddr)>> {
-    let net = SlicedPacket::from_ip(&buf)?.net;
+    let net = SlicedPacket::from_ip(buf)?.net;
 
     match net {
         Some(NetSlice::Ipv4(ipv4)) => {

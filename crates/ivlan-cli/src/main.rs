@@ -34,10 +34,8 @@ impl Config {
 
     fn read(path: &Path) -> Self {
         let bytes = std::fs::read(path).expect("Failed to read the configuration file.");
-        let config = toml::from_slice(bytes.as_slice())
-            .expect("Failed to deserialize the configuration file.");
 
-        config
+        toml::from_slice(bytes.as_slice()).expect("Failed to deserialize the configuration file.")
     }
 
     fn write(&self, path: &Path) {
