@@ -55,16 +55,14 @@ jobs:
 
   build-macos:
     name: macOS builds
-    runs-on: ${{ matrix.os }}
+    runs-on: macos-14
 
     strategy:
       matrix:
         include:
-          - os: macos-13
-            target: x86_64-apple-darwin
+          - target: x86_64-apple-darwin
             suffix: macos-x86_64
-          - os: macos-14
-            target: aarch64-apple-darwin
+          - target: aarch64-apple-darwin
             suffix: macos-arm64
 
     steps:
@@ -84,7 +82,7 @@ jobs:
       - name: Build ivland
         run: cargo build -p ivland --release --target ${{ matrix.target }}
 
-      - name: Package binaries
+      - name: Package
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/ivlan-cli dist/ivlan
@@ -93,7 +91,7 @@ jobs:
           strip dist/ivland || true
           tar -czf ${{ matrix.suffix }}.tar.gz -C dist .
 
-      - name: Upload artifacts
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.suffix }}
