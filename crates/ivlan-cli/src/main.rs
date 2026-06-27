@@ -5,7 +5,7 @@ use std::{
 };
 
 use clap::Parser;
-use ivlan_rpc::RemoteId;
+use ivlan_rpc::{Auth, RemoteId};
 use serde::{Deserialize, Serialize};
 use tarpc::tokio_serde::formats::Json;
 
@@ -65,6 +65,9 @@ enum Command {
     Init,
     Connect {
         remote: RemoteId,
+
+        #[arg(long, short)]
+        password: Option<String>,
     },
     Lookup {
         remote: RemoteId,
@@ -107,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap()
                 .unwrap();
         }
-        Command::Connect { remote } => {
+        Command::Connect { remote, password } => {
             let mut transport = tarpc::serde_transport::tcp::connect(args.rpc_addr, Json::default);
             transport.config_mut().max_frame_length(usize::MAX);
 
@@ -118,7 +121,11 @@ async fn main() -> anyhow::Result<()> {
             .spawn();
 
             let addrs = client
-                .connect(tarpc::context::current(), remote)
+                .connect(
+                    tarpc::context::current(),
+                    remote,
+                    password.map(Auth::Password).unwrap_or(Auth::None),
+                )
                 .await
                 .unwrap()
                 .unwrap();

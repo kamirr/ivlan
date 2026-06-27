@@ -131,10 +131,16 @@ impl std::error::Error for RemoteIdParseError {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub enum Auth {
+    None,
+    Password(String),
+}
+
 #[tarpc::service]
 pub trait IvLanService {
     async fn start(_sk: iroh::SecretKey) -> Result<(), String>;
-    async fn connect(_id: RemoteId) -> Result<IpAddrs, String>;
+    async fn connect(_id: RemoteId, _auth: Auth) -> Result<IpAddrs, String>;
     async fn lookup(_id: RemoteId) -> Result<IpAddrs, String>;
     async fn peers() -> BTreeMap<RemoteId, IpAddrs>;
 }

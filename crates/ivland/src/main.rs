@@ -1,3 +1,4 @@
+mod auth;
 mod ip_util;
 
 use std::{
@@ -12,7 +13,7 @@ use dashmap::DashMap;
 use etherparse::{ArpOperation, NetSlice, SlicedPacket};
 use futures::StreamExt as _;
 use iroh::endpoint::{RecvStream, SendStream};
-use ivlan_rpc::{IpAddrs, IvLanService, RemoteId};
+use ivlan_rpc::{Auth, IpAddrs, IvLanService, RemoteId};
 use tarpc::{
     server::{Channel as _, incoming::Incoming as _},
     tokio_serde::formats::Json,
@@ -28,6 +29,8 @@ use tokio::{
     time::{Duration, sleep},
 };
 use tun_rs::{AsyncDevice, DeviceBuilder};
+
+use crate::auth::AuthResp;
 
 type OutboundMessage = Vec<u8>;
 
@@ -50,10 +53,21 @@ struct IvLanStateInner {
 }
 
 impl IvLanStateInner {
+    fn remove_peer(&self, remote: RemoteId) {
+        if let Some((_, mut peer)) = self.peers.remove(&remote) {
+            if let Some(rx_task_ab_handle) = peer.rx_task.take() {
+                rx_task_ab_handle.abort();
+            }
+
+            drop(peer);
+        }
+    }
+
     async fn insert_peer(
         self: Arc<Self>,
         remote: RemoteId,
         txrx: Option<(SendStream, RecvStream)>,
+        auth: Auth,
     ) -> anyhow::Result<IpAddrs> {
         if let Some(mut peer) = self.peers.get_mut(&remote) {
             if let Some((tx, rx)) = txrx {
@@ -72,7 +86,8 @@ impl IvLanStateInner {
 
         let (queue_tx, queue_rx) = mpsc::channel(self.out_queue_cap);
         let send = Arc::new(Mutex::new(None));
-        self.clone().start_send_task(remote, send.clone(), queue_rx);
+        self.clone()
+            .start_send_task(remote, send.clone(), queue_rx, auth);
 
         let ipv4 = match self.allocate_ipv4() {
             Some(addr) => addr,
@@ -123,6 +138,7 @@ impl IvLanStateInner {
         remote: RemoteId,
         send: Arc<Mutex<Option<SendStream>>>,
         mut queue_rx: mpsc::Receiver<OutboundMessage>,
+        auth: Auth,
     ) {
         tokio::spawn(async move {
             while let Some(msg) = queue_rx.recv().await {
@@ -131,7 +147,7 @@ impl IvLanStateInner {
                     if send_guard.is_none() {
                         drop(send_guard);
                         log::debug!("No send stream for peer {}, attempting connect", remote);
-                        if let Err(e) = self.clone().ensure_send_stream(remote).await {
+                        if let Err(e) = self.clone().ensure_send_stream(remote, &auth).await {
                             log::warn!("Failed to establish send stream for {}: {}", remote, e);
                             sleep(Duration::from_secs(1)).await;
                             continue;
@@ -214,7 +230,11 @@ impl IvLanStateInner {
         }).abort_handle()
     }
 
-    async fn ensure_send_stream(self: Arc<Self>, remote: RemoteId) -> anyhow::Result<()> {
+    async fn ensure_send_stream(
+        self: Arc<Self>,
+        remote: RemoteId,
+        auth: &Auth,
+    ) -> anyhow::Result<()> {
         let endpoint = self
             .endpoint
             .get()
@@ -223,8 +243,17 @@ impl IvLanStateInner {
 
         let pk: iroh::PublicKey = remote.into();
         let conn = endpoint.connect(pk, b"ivlan/1.0").await?;
-        let txrx = conn.open_bi().await?;
-        self.clone().insert_peer(remote, Some(txrx)).await?;
+        let mut txrx = conn.open_bi().await?;
+
+        auth::write_auth(auth, &mut txrx.0).await?;
+
+        if auth::read_auth_resp(&mut txrx.1).await? == AuthResp::Bad {
+            log::info!("Failed auth with {remote}, remove peer.");
+            self.remove_peer(remote);
+        }
+
+        self.insert_peer(remote, Some(txrx), auth.clone()).await?;
+
         Ok(())
     }
 
@@ -343,28 +372,46 @@ impl IvLanState {
                 let accepting = match incoming.accept() {
                     Ok(a) => a,
                     Err(e) => {
-                        log::warn!("Couldn't accept connection: {}", e);
+                        log::warn!("Couldn't accept connection: {e}");
                         continue;
                     }
                 };
                 let conn = match accepting.await {
                     Ok(c) => c,
                     Err(e) => {
-                        log::warn!("Couldn't accept connection: {}", e);
+                        log::warn!("Couldn't accept connection: {e}");
                         continue;
                     }
                 };
 
-                let txrx = match conn.accept_bi().await {
+                let mut txrx = match conn.accept_bi().await {
                     Ok(p) => p,
                     Err(e) => {
-                        log::warn!("Couldn't accept bidirectional: {}", e);
+                        log::warn!("Couldn't accept bidir from {}: {}", conn.remote_id(), e);
                         continue;
                     }
                 };
 
+                let auth = match auth::read_auth(&mut txrx.1).await {
+                    Ok(auth) => auth,
+                    Err(e) => {
+                        log::info!("Bad auth from {}: {}", conn.remote_id(), e);
+                        continue;
+                    }
+                };
+
+                log::info!("Auth from {}: {:?}", conn.remote_id(), auth);
+                if let Err(e) = auth::write_auth_resp(&AuthResp::Ok, &mut txrx.0).await {
+                    log::warn!("Couldn't send auth response to {}: {}", conn.remote_id(), e);
+                    continue;
+                }
+
                 let remote = conn.remote_id().into();
-                state.clone().insert_peer(remote, Some(txrx)).await.unwrap();
+                state
+                    .clone()
+                    .insert_peer(remote, Some(txrx), Auth::None)
+                    .await
+                    .unwrap();
             }
         });
 
@@ -499,12 +546,13 @@ impl IvLanState {
         self,
         _cx: tarpc::context::Context,
         remote: RemoteId,
+        auth: Auth,
     ) -> anyhow::Result<IpAddrs> {
         if let Some(peer) = self.inner.peers.get(&remote) {
             return Ok(peer.addrs);
         }
 
-        let peer_addrs = self.inner.clone().insert_peer(remote, None).await?;
+        let peer_addrs = self.inner.clone().insert_peer(remote, None, auth).await?;
         Ok(peer_addrs)
     }
 
@@ -538,8 +586,9 @@ impl IvLanService for IvLanState {
         self,
         cx: tarpc::context::Context,
         remote: RemoteId,
+        auth: Auth,
     ) -> Result<IpAddrs, String> {
-        self.connect_impl(cx, remote)
+        self.connect_impl(cx, remote, auth)
             .await
             .map_err(|e| e.to_string())
     }
