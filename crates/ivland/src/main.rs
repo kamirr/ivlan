@@ -185,7 +185,7 @@ impl IvLanStateInner {
                 ) {
                     Ok(patch) => patch,
                     Err(e) => {
-                        log::warn!("IV recv/0 src={remote}, payload={len} | BAD PACKET | {e}");
+                        log::warn!("IV recv src={remote}, payload={len} | BAD PACKET | {e}");
                         if len == 0 {
                             panic!();
                         }
@@ -196,10 +196,10 @@ impl IvLanStateInner {
                 if let Some((src, dst)) = patch {
                     let txd = dev.send(&buf[..len]).await.unwrap();
                     log::trace!(
-                        "IV recv/0 src={remote}, payload={len} | PATCHED src={src}, dst={dst} | WR {txd}"
+                        "IV recv src={remote}, payload={len} | PATCHED src={src}, dst={dst} | WR {txd}"
                     );
                 } else {
-                    log::debug!("IV recv/0 src={remote}, payload={len} | SKIP");
+                    log::debug!("IV recv src={remote}, payload={len} | SKIP");
                 }
             }
         }).abort_handle()
