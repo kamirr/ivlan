@@ -2,26 +2,42 @@ mod ip_util;
 
 use std::{
     collections::BTreeMap,
+    future::Future,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use clap::Parser;
 use dashmap::DashMap;
 use etherparse::{ArpOperation, NetSlice, SlicedPacket};
-use futures::{StreamExt as _, lock::Mutex};
+use futures::StreamExt as _;
 use iroh::endpoint::{RecvStream, SendStream};
 use ivlan_rpc::{IpAddrs, IvLanService, RemoteId};
 use tarpc::{
     server::{Channel as _, incoming::Incoming as _},
     tokio_serde::formats::Json,
 };
-use tokio::io::AsyncReadExt as _;
+use tokio::{
+    io::AsyncReadExt as _,
+    sync::{Mutex, mpsc},
+    task::AbortHandle,
+    time::{Duration, sleep},
+};
 use tun_rs::{AsyncDevice, DeviceBuilder};
+
+const MAX_QUEUE_BYTES: usize = 1 << 20;
+
+type OutboundMessage = Vec<u8>;
 
 struct Peer {
     addrs: IpAddrs,
-    tx: SendStream,
+    send: Arc<Mutex<Option<SendStream>>>,
+    queue_tx: mpsc::UnboundedSender<OutboundMessage>,
+    queue_size: Arc<AtomicUsize>,
+    rx_task: Option<AbortHandle>,
 }
 
 struct IvLanStateInner {
@@ -35,10 +51,30 @@ struct IvLanStateInner {
 }
 
 impl IvLanStateInner {
-    fn insert_peer(&self, remote: RemoteId, tx: SendStream) -> anyhow::Result<IpAddrs> {
-        if let Some(peer) = self.peers.get(&remote) {
+    async fn insert_peer(
+        self: Arc<Self>,
+        remote: RemoteId,
+        txrx: Option<(SendStream, RecvStream)>,
+    ) -> anyhow::Result<IpAddrs> {
+        if let Some(mut peer) = self.peers.get_mut(&remote) {
+            if let Some((tx, rx)) = txrx {
+                if let Some(prev) = peer.rx_task.take() {
+                    prev.abort();
+                }
+
+                let mut send_guard = peer.send.lock().await;
+                *send_guard = Some(tx);
+                drop(send_guard);
+                peer.rx_task = Some(self.start_recv_task(remote, rx, peer.addrs));
+            }
             return Ok(peer.addrs);
         }
+
+        let (queue_tx, queue_rx) = mpsc::unbounded_channel();
+        let queue_size = Arc::new(AtomicUsize::new(0));
+        let send = Arc::new(Mutex::new(None));
+        self.clone()
+            .start_send_task(remote, send.clone(), queue_rx, queue_size.clone());
 
         let ipv4 = match self.allocate_ipv4() {
             Some(addr) => addr,
@@ -64,8 +100,123 @@ impl IvLanStateInner {
         );
 
         let addrs = IpAddrs { v4: ipv4, v6: ipv6 };
-        self.peers.insert(remote, Peer { addrs, tx });
+        let rx_task = if let Some((tx, rx)) = txrx {
+            let mut send_guard = send.lock().await;
+            *send_guard = Some(tx);
+            Some(self.start_recv_task(remote, rx, addrs))
+        } else {
+            None
+        };
+
+        self.peers.insert(
+            remote,
+            Peer {
+                addrs,
+                send,
+                queue_tx,
+                queue_size,
+                rx_task,
+            },
+        );
         Ok(addrs)
+    }
+
+    fn start_send_task(
+        self: Arc<Self>,
+        remote: RemoteId,
+        send: Arc<Mutex<Option<SendStream>>>,
+        mut queue_rx: mpsc::UnboundedReceiver<OutboundMessage>,
+        queue_size: Arc<AtomicUsize>,
+    ) {
+        tokio::spawn(async move {
+            while let Some(msg) = queue_rx.recv().await {
+                loop {
+                    let mut send_guard = send.lock().await;
+                    if send_guard.is_none() {
+                        drop(send_guard);
+                        log::debug!("No send stream for peer {}, attempting connect", remote);
+                        if let Err(e) = self.clone().ensure_send_stream(remote).await {
+                            log::warn!("Failed to establish send stream for {}: {}", remote, e);
+                            sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
+                        continue;
+                    }
+
+                    let result = send_guard.as_mut().unwrap().write_all(&msg).await;
+                    match result {
+                        Ok(()) => {
+                            queue_size.fetch_sub(msg.len(), Ordering::AcqRel);
+                            break;
+                        }
+                        Err(e) => {
+                            log::warn!("Send failure for {}: {}", remote, e);
+                            *send_guard = None;
+                            drop(send_guard);
+                            sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    fn start_recv_task(
+        &self,
+        remote: RemoteId,
+        rx: RecvStream,
+        peer_addrs: IpAddrs,
+    ) -> AbortHandle {
+        let host_addrs = self.addrs;
+        let mut buf = vec![0; 65536];
+        let mut rx = rx;
+        let dev = Arc::clone(&self.dev);
+
+        tokio::spawn(async move {
+            loop {
+                let len = rx.read_u16_le().await.unwrap() as usize;
+                rx.read_exact(&mut buf[..len]).await.unwrap();
+
+                let patch = match ip_util::patch_packet_addresses(
+                    &mut buf[..len],
+                    peer_addrs,
+                    host_addrs,
+                ) {
+                    Ok(patch) => patch,
+                    Err(e) => {
+                        log::warn!("IV recv/0 src={remote}, payload={len} | BAD PACKET | {e}");
+                        if len == 0 {
+                            panic!();
+                        }
+                        continue;
+                    }
+                };
+
+                if let Some((src, dst)) = patch {
+                    let txd = dev.send(&buf[..len]).await.unwrap();
+                    log::trace!(
+                        "IV recv/0 src={remote}, payload={len} | PATCHED src={src}, dst={dst} | WR {txd}"
+                    );
+                } else {
+                    log::debug!("IV recv/0 src={remote}, payload={len} | SKIP");
+                }
+            }
+        }).abort_handle()
+    }
+
+    async fn ensure_send_stream(self: Arc<Self>, remote: RemoteId) -> anyhow::Result<()> {
+        let endpoint = self
+            .endpoint
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("Endpoint not initialized"))?
+            .clone();
+
+        let pk: iroh::PublicKey = remote.into();
+        let conn = endpoint.connect(pk, b"ivlan/1.0").await?;
+        let txrx = conn.open_bi().await?;
+        self.clone().insert_peer(remote, Some(txrx)).await?;
+        Ok(())
     }
 
     fn allocate_ipv4(&self) -> Option<Ipv4Addr> {
@@ -124,44 +275,6 @@ impl IvLanStateInner {
         }
 
         None
-    }
-
-    fn start_rx_stream(&self, remote: RemoteId, rx: RecvStream, peer_addrs: IpAddrs) {
-        let host_addrs = self.addrs;
-        let mut buf = vec![0; 65536];
-        let mut rx = rx;
-        let dev = Arc::clone(&self.dev);
-
-        tokio::spawn(async move {
-            loop {
-                let len = rx.read_u16_le().await.unwrap() as usize;
-                rx.read_exact(&mut buf[..len]).await.unwrap();
-
-                let patch = match ip_util::patch_packet_addresses(
-                    &mut buf[..len],
-                    peer_addrs,
-                    host_addrs,
-                ) {
-                    Ok(patch) => patch,
-                    Err(e) => {
-                        log::warn!("IV recv/0 src={remote}, payload={len} | BAD PACKET | {e}");
-                        if len == 0 {
-                            panic!();
-                        }
-                        continue;
-                    }
-                };
-
-                if let Some((src, dst)) = patch {
-                    let txd = dev.send(&buf[..len]).await.unwrap();
-                    log::trace!(
-                        "IV recv/0 src={remote}, payload={len} | PATCHED src={src}, dst={dst} | WR {txd}"
-                    );
-                } else {
-                    log::debug!("IV recv/0 src={remote}, payload={len} | SKIP");
-                }
-            }
-        });
     }
 }
 
@@ -231,7 +344,7 @@ impl IvLanState {
                     }
                 };
 
-                let (tx, rx) = match conn.accept_bi().await {
+                let txrx = match conn.accept_bi().await {
                     Ok(p) => p,
                     Err(e) => {
                         log::warn!("Couldn't accept bidirectional: {}", e);
@@ -240,8 +353,7 @@ impl IvLanState {
                 };
 
                 let remote = conn.remote_id().into();
-                let peer_addrs = state.insert_peer(remote, tx).unwrap();
-                state.start_rx_stream(remote, rx, peer_addrs);
+                state.clone().insert_peer(remote, Some(txrx)).await.unwrap();
             }
         });
 
@@ -261,18 +373,51 @@ impl IvLanState {
                         let dst = ipv4.header().destination_addr();
                         let peer = state.peers.iter_mut().find(|peer| peer.addrs.v4 == dst);
 
-                        if let Some(mut peer) = peer {
-                            peer.tx.write_all(&len.to_le_bytes()).await.unwrap();
-                            peer.tx.write_all(&buf[..len as usize]).await.unwrap();
+                        if let Some(peer) = peer {
+                            let mut msg = Vec::with_capacity(2 + len as usize);
+                            msg.extend_from_slice(&len.to_le_bytes());
+                            msg.extend_from_slice(&buf[..len as usize]);
+                            let msg_len = msg.len();
 
-                            log::trace!(
-                                "IPv4 src={}, dst={}, payload={}, len={} | TX {}",
-                                ipv4.header().source_addr(),
-                                ipv4.header().destination_addr(),
-                                ipv4.payload().payload.len(),
-                                len,
-                                peer.key()
-                            )
+                            let mut current = peer.queue_size.load(Ordering::Acquire);
+                            loop {
+                                if current + msg_len > MAX_QUEUE_BYTES {
+                                    log::warn!(
+                                        "Dropping outbound packet to {}: queue full ({} bytes)",
+                                        peer.key(),
+                                        current
+                                    );
+                                    break;
+                                }
+
+                                match peer.queue_size.compare_exchange(
+                                    current,
+                                    current + msg_len,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                ) {
+                                    Ok(_) => {
+                                        if peer.queue_tx.send(msg).is_err() {
+                                            peer.queue_size.fetch_sub(msg_len, Ordering::AcqRel);
+                                            log::warn!(
+                                                "Failed to enqueue packet for peer {}",
+                                                peer.key()
+                                            );
+                                        } else {
+                                            log::trace!(
+                                                "IPv4 src={}, dst={}, payload={}, len={} | QUEUED {}",
+                                                ipv4.header().source_addr(),
+                                                ipv4.header().destination_addr(),
+                                                ipv4.payload().payload.len(),
+                                                len,
+                                                peer.key()
+                                            );
+                                        }
+                                        break;
+                                    }
+                                    Err(next) => current = next,
+                                }
+                            }
                         } else {
                             log::debug!(
                                 "IPv4 src={}, dst={}, payload={}, len={} | NO PEER",
@@ -299,18 +444,51 @@ impl IvLanState {
 
                         let peer = state.peers.iter_mut().find(|peer| peer.addrs.v6 == dst);
 
-                        if let Some(mut peer) = peer {
-                            peer.tx.write(&len.to_le_bytes()).await.unwrap();
-                            peer.tx.write_all(&buf[..len as usize]).await.unwrap();
+                        if let Some(peer) = peer {
+                            let mut msg = Vec::with_capacity(2 + len as usize);
+                            msg.extend_from_slice(&len.to_le_bytes());
+                            msg.extend_from_slice(&buf[..len as usize]);
+                            let msg_len = msg.len();
 
-                            log::trace!(
-                                "IPv6 src={}, dst={}, payload={}, len={} | TX {}",
-                                ipv6.header().source_addr(),
-                                ipv6.header().destination_addr(),
-                                ipv6.payload().payload.len(),
-                                len,
-                                peer.key()
-                            )
+                            let mut current = peer.queue_size.load(Ordering::Acquire);
+                            loop {
+                                if current + msg_len > MAX_QUEUE_BYTES {
+                                    log::warn!(
+                                        "Dropping outbound packet to {}: queue full ({} bytes)",
+                                        peer.key(),
+                                        current
+                                    );
+                                    break;
+                                }
+
+                                match peer.queue_size.compare_exchange(
+                                    current,
+                                    current + msg_len,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                ) {
+                                    Ok(_) => {
+                                        if peer.queue_tx.send(msg).is_err() {
+                                            peer.queue_size.fetch_sub(msg_len, Ordering::AcqRel);
+                                            log::warn!(
+                                                "Failed to enqueue packet for peer {}",
+                                                peer.key()
+                                            );
+                                        } else {
+                                            log::trace!(
+                                                "IPv6 src={}, dst={}, payload={}, len={} | QUEUED {}",
+                                                ipv6.header().source_addr(),
+                                                ipv6.header().destination_addr(),
+                                                ipv6.payload().payload.len(),
+                                                len,
+                                                peer.key()
+                                            );
+                                        }
+                                        break;
+                                    }
+                                    Err(next) => current = next,
+                                }
+                            }
                         } else {
                             log::debug!(
                                 "IPv6 src={}, dst={}, payload={}, len={} | NO PEER",
@@ -349,7 +527,6 @@ impl IvLanState {
             return Ok(peer.addrs);
         }
 
-        // Peer not found, establish a connection via iroh
         let endpoint = self
             .inner
             .endpoint
@@ -357,15 +534,15 @@ impl IvLanState {
             .ok_or_else(|| anyhow::anyhow!("Endpoint not initialized"))?
             .clone();
 
-        // Connect to the remote peer
         let pk: iroh::PublicKey = remote.into();
         let conn = endpoint.connect(pk, b"ivlan/1.0").await?;
-        let (tx, rx) = conn.open_bi().await?;
+        let txrx = conn.open_bi().await?;
 
-        // Allocate addresses and start recv stream
-        let peer_addrs = self.inner.insert_peer(conn.remote_id().into(), tx)?;
-        self.inner
-            .start_rx_stream(conn.remote_id().into(), rx, peer_addrs);
+        let peer_addrs = self
+            .inner
+            .clone()
+            .insert_peer(conn.remote_id().into(), Some(txrx))
+            .await?;
 
         Ok(peer_addrs)
     }
