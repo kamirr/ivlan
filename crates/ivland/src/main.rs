@@ -4,10 +4,7 @@ use std::{
     collections::BTreeMap,
     future::Future,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::{
-        Arc, OnceLock,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, OnceLock},
 };
 
 use clap::Parser;
@@ -73,10 +70,8 @@ impl IvLanStateInner {
         }
 
         let (queue_tx, queue_rx) = mpsc::channel(self.out_queue_cap);
-        let queue_size = Arc::new(AtomicUsize::new(0));
         let send = Arc::new(Mutex::new(None));
-        self.clone()
-            .start_send_task(remote, send.clone(), queue_rx, queue_size.clone());
+        self.clone().start_send_task(remote, send.clone(), queue_rx);
 
         let ipv4 = match self.allocate_ipv4() {
             Some(addr) => addr,
@@ -127,7 +122,6 @@ impl IvLanStateInner {
         remote: RemoteId,
         send: Arc<Mutex<Option<SendStream>>>,
         mut queue_rx: mpsc::Receiver<OutboundMessage>,
-        queue_size: Arc<AtomicUsize>,
     ) {
         tokio::spawn(async move {
             while let Some(msg) = queue_rx.recv().await {
@@ -147,7 +141,6 @@ impl IvLanStateInner {
                     let result = send_guard.as_mut().unwrap().write_all(&msg).await;
                     match result {
                         Ok(()) => {
-                            queue_size.fetch_sub(msg.len(), Ordering::AcqRel);
                             break;
                         }
                         Err(e) => {
