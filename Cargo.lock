@@ -1940,7 +1940,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "ivlan-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -1956,7 +1956,7 @@ dependencies = [
 
 [[package]]
 name = "ivlan-rpc"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64",
  "iroh",
@@ -1967,7 +1967,7 @@ dependencies = [
 
 [[package]]
 name = "ivland"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
