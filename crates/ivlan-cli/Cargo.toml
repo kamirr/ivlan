@@ -3,6 +3,10 @@ name = "ivlan-cli"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "ivlan"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 base64 = "0.22.1"
