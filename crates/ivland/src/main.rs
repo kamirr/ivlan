@@ -8,11 +8,12 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use bytes::{Bytes, BytesMut};
 use clap::Parser;
 use dashmap::DashMap;
 use etherparse::{ArpOperation, NetSlice, SlicedPacket};
 use futures::StreamExt as _;
-use iroh::endpoint::{RecvStream, SendStream};
+use iroh::endpoint::{Connection, RecvStream, SendDatagramError, SendStream};
 use ivlan_rpc::{Auth, IpAddrs, IvLanService, RemoteId};
 use tarpc::{
     server::{Channel as _, incoming::Incoming as _},
@@ -34,11 +35,58 @@ use crate::auth::AuthResp;
 
 type OutboundMessage = Vec<u8>;
 
+struct AbortRecv {
+    stream_ah: AbortHandle,
+    datagram_ah: AbortHandle,
+}
+
+impl AbortRecv {
+    pub fn new(stream_ah: AbortHandle, datagram_ah: AbortHandle) -> Self {
+        AbortRecv {
+            stream_ah,
+            datagram_ah,
+        }
+    }
+
+    pub fn abort(&self) {
+        self.stream_ah.abort();
+        self.datagram_ah.abort();
+    }
+}
+
+struct PeerRx {
+    stream: RecvStream,
+    conn: Connection,
+}
+
+impl PeerRx {
+    pub fn new(conn: Connection, stream: RecvStream) -> Self {
+        PeerRx { stream, conn }
+    }
+}
+
+struct PeerTx {
+    stream: SendStream,
+    conn: Connection,
+    datagram_sz_cfg: Option<usize>,
+}
+
+impl PeerTx {
+    pub fn new(conn: Connection, stream: SendStream) -> Self {
+        let datagram_sz_cfg = conn.max_datagram_size();
+        PeerTx {
+            stream,
+            conn,
+            datagram_sz_cfg,
+        }
+    }
+}
+
 struct Peer {
     addrs: IpAddrs,
-    send: Arc<Mutex<Option<SendStream>>>,
+    send: Arc<Mutex<Option<PeerTx>>>,
     queue_tx: mpsc::Sender<OutboundMessage>,
-    rx_task: Option<AbortHandle>,
+    rx_task: Option<AbortRecv>,
 }
 
 struct AuthRules {
@@ -72,20 +120,24 @@ impl IvLanStateInner {
     async fn insert_peer(
         self: Arc<Self>,
         remote: RemoteId,
-        txrx: Option<(SendStream, RecvStream)>,
+        txrx: Option<(Connection, SendStream, RecvStream)>,
         auth: Auth,
     ) -> anyhow::Result<IpAddrs> {
         if let Some(mut peer) = self.peers.get_mut(&remote) {
-            if let Some((tx, rx)) = txrx {
+            if let Some((conn, tx, rx)) = txrx {
                 if let Some(prev) = peer.rx_task.take() {
                     prev.abort();
                 }
 
                 let mut send_guard = peer.send.lock().await;
-                *send_guard = Some(tx);
+                *send_guard = Some(PeerTx::new(conn.clone(), tx));
                 drop(send_guard);
-                peer.rx_task =
-                    Some(self.start_recv_task(remote, rx, peer.send.clone(), peer.addrs));
+                peer.rx_task = Some(self.start_recv_task(
+                    remote,
+                    PeerRx::new(conn, rx),
+                    peer.send.clone(),
+                    peer.addrs,
+                ));
             }
             return Ok(peer.addrs);
         }
@@ -119,10 +171,10 @@ impl IvLanStateInner {
         );
 
         let addrs = IpAddrs { v4: ipv4, v6: ipv6 };
-        let rx_task = if let Some((tx, rx)) = txrx {
+        let rx_task = if let Some((conn, tx, rx)) = txrx {
             let mut send_guard = send.lock().await;
-            *send_guard = Some(tx);
-            Some(self.start_recv_task(remote, rx, send.clone(), addrs))
+            *send_guard = Some(PeerTx::new(conn.clone(), tx));
+            Some(self.start_recv_task(remote, PeerRx::new(conn, rx), send.clone(), addrs))
         } else {
             None
         };
@@ -142,7 +194,7 @@ impl IvLanStateInner {
     fn start_send_task(
         self: Arc<Self>,
         remote: RemoteId,
-        send: Arc<Mutex<Option<SendStream>>>,
+        send: Arc<Mutex<Option<PeerTx>>>,
         mut queue_rx: mpsc::Receiver<OutboundMessage>,
         auth: Auth,
     ) {
@@ -161,9 +213,48 @@ impl IvLanStateInner {
                         continue;
                     }
 
-                    let result = send_guard.as_mut().unwrap().write_all(&msg).await;
+                    let peer_tx = send_guard.as_mut().unwrap();
+                    let len = msg.len();
+
+                    if let Some(max_sz) = peer_tx.datagram_sz_cfg
+                        && msg.len() <= max_sz
+                    {
+                        match peer_tx.conn.send_datagram(Bytes::from_owner(msg)) {
+                            Ok(_) => {
+                                log::trace!("TX DATAGRAM {len}b to {remote}.");
+                                break;
+                            }
+                            Err(SendDatagramError::ConnectionLost(e)) => {
+                                log::warn!("Send failure for {}: {}; dropped.", remote, e);
+                                *send_guard = None;
+                                drop(send_guard);
+                                break;
+                            }
+                            Err(SendDatagramError::Disabled) => {
+                                log::warn!("Datagram support disabled locally; dropped.");
+                                peer_tx.datagram_sz_cfg = None;
+                                break;
+                            }
+                            Err(SendDatagramError::TooLarge) => {
+                                peer_tx.datagram_sz_cfg = peer_tx.conn.max_datagram_size();
+                                log::warn!(
+                                    "Max datagram size changed, new size is {:?}; dropped.",
+                                    peer_tx.datagram_sz_cfg
+                                );
+                                break;
+                            }
+                            Err(SendDatagramError::UnsupportedByPeer) => {
+                                log::warn!("Datagram support disabled by peer; dropped.");
+                                peer_tx.datagram_sz_cfg = None;
+                                break;
+                            }
+                        }
+                    }
+
+                    let result = peer_tx.stream.write_all(&msg).await;
                     match result {
                         Ok(()) => {
+                            log::trace!("TX STREAM {len}b to {remote}.");
                             break;
                         }
                         Err(e) => {
@@ -182,26 +273,26 @@ impl IvLanStateInner {
     fn start_recv_task(
         &self,
         remote: RemoteId,
-        rx: RecvStream,
-        tx: Arc<Mutex<Option<SendStream>>>,
+        rx: PeerRx,
+        tx: Arc<Mutex<Option<PeerTx>>>,
         peer_addrs: IpAddrs,
-    ) -> AbortHandle {
+    ) -> AbortRecv {
         let host_addrs = self.addrs;
-        let mut buf = vec![0; 65536];
-        let mut rx = rx;
-        let dev = Arc::clone(&self.dev);
+        let PeerRx { mut stream, conn } = rx;
 
-        tokio::spawn(async move {
+        let mut buf = vec![0; 65536];
+        let dev = Arc::clone(&self.dev);
+        let stream = tokio::spawn(async move {
             loop {
-                let len: usize = match rx.read_u16_le().await {
+                let len: usize = match stream.read_u16_le().await {
                     Ok(len) => len.into(),
                     Err(e) => {
-                        log::info!("IV recv src={remote} | ERROR | {e}");
+                        log::info!("IV recv STREAM src={remote} | ERROR | {e}");
                         break;
                     },
                 };
-                if let Err(e) = rx.read_exact(&mut buf[..len]).await {
-                    log::info!("IV recv src={remote} | ERROR | {e}");
+                if let Err(e) = stream.read_exact(&mut buf[..len]).await {
+                    log::info!("IV recv STREAM src={remote} | ERROR | {e}");
                     break;
                 }
 
@@ -212,10 +303,7 @@ impl IvLanStateInner {
                 ) {
                     Ok(patch) => patch,
                     Err(e) => {
-                        log::warn!("IV recv src={remote}, payload={len} | BAD PACKET | {e}");
-                        if len == 0 {
-                            panic!();
-                        }
+                        log::warn!("IV recv STREAM src={remote}, payload={len} | BAD PACKET | {e}");
                         continue;
                     }
                 };
@@ -223,17 +311,56 @@ impl IvLanStateInner {
                 if let Some((src, dst)) = patch {
                     let txd = dev.send(&buf[..len]).await.unwrap();
                     log::trace!(
-                        "IV recv src={remote}, payload={len} | PATCHED src={src}, dst={dst} | WR {txd}"
+                        "IV recv STREAM src={remote}, payload={len} | PATCHED src={src}, dst={dst} | WR {txd}"
                     );
                 } else {
-                    log::debug!("IV recv src={remote}, payload={len} | SKIP");
+                    log::debug!("IV recv STREAM src={remote}, payload={len} | SKIP");
                 }
             }
 
             // Delete the corresponding sender to ensure that
             // the connection is dropped or in a bad state ASAP.
             *tx.lock().await = None;
-        }).abort_handle()
+        }).abort_handle();
+
+        let dev = Arc::clone(&self.dev);
+        let datagram = tokio::spawn(async move {
+            loop {
+                let mut bytes = match conn.read_datagram().await {
+                    Ok(bytes) => BytesMut::from(bytes), 
+                    Err(e) => {
+                        log::info!("IV recv DATAGRAM src={remote} | ERROR | {e}");
+                        break;
+                    }
+                };
+                let mut packet = &mut bytes[2..];
+                let len = packet.len();
+
+                let patch = match ip_util::patch_packet_addresses(
+                    &mut packet,
+                    peer_addrs,
+                    host_addrs,
+                ) {
+                    Ok(patch) => patch,
+                    Err(e) => {
+                        log::warn!("IV recv DATAGRAM src={remote}, payload={len} | BAD PACKET | {e}");
+                        continue;
+                    }
+                };
+
+                if let Some((src, dst)) = patch {
+                    let txd = dev.send(&packet).await.unwrap();
+                    log::trace!(
+                        "IV recv DATAGRAM src={remote}, payload={len} | PATCHED src={src}, dst={dst} | WR {txd}"
+                    );
+                } else {
+                    log::debug!("IV recv DATAGRAM src={remote}, payload={len} | SKIP");
+                }
+            }
+        })
+        .abort_handle();
+
+        AbortRecv::new(stream, datagram)
     }
 
     async fn ensure_send_stream(
@@ -249,16 +376,17 @@ impl IvLanStateInner {
 
         let pk: iroh::PublicKey = remote.into();
         let conn = endpoint.connect(pk, b"ivlan/1.0").await?;
-        let mut txrx = conn.open_bi().await?;
+        let (mut tx, mut rx) = conn.open_bi().await?;
 
-        auth::write_auth(auth, &mut txrx.0).await?;
+        auth::write_auth(auth, &mut tx).await?;
 
-        if auth::read_auth_resp(&mut txrx.1).await? == AuthResp::Bad {
+        if auth::read_auth_resp(&mut rx).await? == AuthResp::Bad {
             log::info!("Failed auth with {remote}, remove peer.");
             self.remove_peer(remote);
         }
 
-        self.insert_peer(remote, Some(txrx), auth.clone()).await?;
+        self.insert_peer(remote, Some((conn, tx, rx)), auth.clone())
+            .await?;
 
         Ok(())
     }
@@ -392,7 +520,7 @@ impl IvLanState {
                     }
                 };
 
-                let mut txrx = match conn.accept_bi().await {
+                let (mut tx, mut rx) = match conn.accept_bi().await {
                     Ok(p) => p,
                     Err(e) => {
                         log::warn!("Couldn't accept bidir from {}: {}", conn.remote_id(), e);
@@ -400,7 +528,7 @@ impl IvLanState {
                     }
                 };
 
-                let auth = match auth::read_auth(&mut txrx.1).await {
+                let auth = match auth::read_auth(&mut rx).await {
                     Ok(auth) => auth,
                     Err(e) => {
                         log::info!("Bad auth from {}: {}", conn.remote_id(), e);
@@ -423,7 +551,7 @@ impl IvLanState {
                     }
                 };
 
-                if let Err(e) = auth::write_auth_resp(&resp, &mut txrx.0).await {
+                if let Err(e) = auth::write_auth_resp(&resp, &mut tx).await {
                     log::warn!("Couldn't send auth response to {}: {}", conn.remote_id(), e);
                     continue;
                 }
@@ -439,7 +567,7 @@ impl IvLanState {
                 let remote = conn.remote_id().into();
                 state
                     .clone()
-                    .insert_peer(remote, Some(txrx), Auth::None)
+                    .insert_peer(remote, Some((conn, tx, rx)), Auth::None)
                     .await
                     .unwrap();
             }

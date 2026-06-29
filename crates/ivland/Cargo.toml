@@ -6,6 +6,7 @@ license = "MIT"
 
 [dependencies]
 anyhow = { workspace = true }
+bytes = "1.12.0"
 clap = { workspace = true }
 ctrlc = "3.5.2"
 dashmap = "6.2.1"
